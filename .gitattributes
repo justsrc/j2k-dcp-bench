@@ -1,0 +1,5 @@
+# Keep test media byte-exact on every platform.
+*.j2k binary
+*.ppm binary
+*.pgm binary
+*.mxf binary

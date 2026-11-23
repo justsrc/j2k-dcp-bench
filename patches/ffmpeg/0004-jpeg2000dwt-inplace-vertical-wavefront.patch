@@ -1,0 +1,228 @@
+From 7a4569f4cd2acd173016260054a8559860e837bb Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:40:05 +0530
+Subject: [PATCH 04/11] avcodec/jpeg2000dwt: fuse the 9/7 float vertical
+ lifting passes
+
+The vertical lifting passes repeatedly gather and scatter each column
+through scratch. Fuse them into a single pass to avoid the repeated
+memory traffic.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ libavcodec/jpeg2000dwt.c | 185 ++++++++++++++++++++++++---------------
+ 1 file changed, 115 insertions(+), 70 deletions(-)
+
+diff --git a/libavcodec/jpeg2000dwt.c b/libavcodec/jpeg2000dwt.c
+index 4089f8e887..e97cbf5fe4 100644
+--- a/libavcodec/jpeg2000dwt.c
++++ b/libavcodec/jpeg2000dwt.c
+@@ -408,93 +408,138 @@ static void sr_1d97_float(float *p, int i0, int i1)
+         p[2 * i + 1] += F_LFTG_ALPHA * (p[2 * i]     + p[2 * i + 2]);
+ }
+ 
+-/* Vertical 9/7 synthesis for full blocks of F_DWT_BLOCK consecutive columns,
+- * using the transposed scratch rows in s->f_blockbuf. Scratch row index r
+- * holds signal row y = i0 - 4 + r (i0 = mv), covering every row the lifting
+- * reads or writes ([i0-4, i1+3]). The value placement, arithmetic, evaluation
+- * order and boundary mirroring replicate the scalar gather + extend97_float +
+- * sr_1d97_float + scatter sequence exactly, so the output is bit-identical to
+- * the per-column pass; only the memory access changes from per-column
+- * gathers/scatters to row-wise operations over the block, which the compiler
+- * vectorizes.
++/* Vertical 9/7 synthesis for full blocks of F_DWT_BLOCK consecutive columns.
++ *
++ * One fused descending wavefront replaces the former gather + four lifting
++ * passes + scatter. p[] is the virtual interleaved signal of the scalar path:
++ * p[i0-4 .. i1+3], i0 = mv, i1 = mv + lv, with p[2i] the even and p[2i+1] the
++ * odd polyphase stream. Iteration i computes E3[i] (p[2i]) and O4[i]
++ * (p[2i+1]) from the three input values p[2i-3 .. 2i-1], carrying E1[i],
++ * O2[i] and E3[i+1] in registers, so each p[] value is loaded once and each
++ * output row written once. The arithmetic, evaluation order and boundary
++ * mirroring are identical to extend97_float + sr_1d97_float + the scalar
++ * scatter, so the output is bit-identical to the per-column pass.
++ *
++ * p[q] is stored at data row q - i0 on output, while its input lives at the
++ * scalar gather's row (q-i0 even: (q-i0)/2, odd: E+(q-i0-1)/2). Only the
++ * high-subband rows (data rows E..lv-1) need copying to scratch first: an
++ * output write can hit a high row before that row is read, whereas a low row
++ * r is read at iteration r+1 and written at iteration <= r, i.e. always read
++ * first. The eight boundary slots p[i0-4..i0-1] and p[i1..i1+3] also live in
++ * scratch and are initialized exactly as extend97_float does.
++ *
+  * Returns the number of columns processed (multiple of F_DWT_BLOCK). */
++static inline const float *dwt97_ver_src(const float *base, const float *scr,
++                                         int w, int i0, int E, int q)
++{
++    /* scalar gather: low rows at even p (p[2mv+2j], j = q/2 - mv), high
++     * rows at odd p (p[1+2(j-E)]), independent of the parity of mv */
++    int r = (q & 1) ? E + (q >> 1) : (q >> 1) - i0;
++
++    return r < E ? base + (size_t)r * w
++                 : scr + (size_t)(r - E) * F_DWT_BLOCK;
++}
++
++static void dwt97_ver_load(float *dst, const float *base, const float *scr,
++                           const float *mir, int w, int i0, int i1, int E,
++                           int q)
++{
++    if (q < i0)
++        memcpy(dst, mir + (size_t)(q - i0 + 4) * F_DWT_BLOCK,
++               F_DWT_BLOCK * sizeof(float));
++    else if (q >= i1)
++        memcpy(dst, mir + (size_t)(4 + q - i1) * F_DWT_BLOCK,
++               F_DWT_BLOCK * sizeof(float));
++    else
++        memcpy(dst, dwt97_ver_src(base, scr, w, i0, E, q),
++               F_DWT_BLOCK * sizeof(float));
++}
++
+ static int dwt_decode97_float_ver_block(DWTContext *s, float *data, int w,
+                                         int lv, int mv, int lh)
+ {
+     const int i0 = mv, i1 = mv + lv;
+-    /* rows[y] maps scratch row r = y - (i0 - 4) for y in [i0-4, i1+3] */
+-    float *rows = s->f_blockbuf + (ptrdiff_t)(4 - i0) * F_DWT_BLOCK;
+-    /* scalar gather interleaving: data rows 0..E-1 land on signal rows
+-     * i0, i0+2, ... (low subband), the rest on i0+1, i0+3, ... (high). */
+     const int E = (lv - mv + 1) >> 1;
+-    int lp0, y, j, i, k;
++    const int O = lv - E;
++    const int lo  = (i0 >> 1) - 1;   /* step 1/2 lower bound */
++    const int hi1 = (i1 >> 1) + 1;   /* step 1 upper bound */
++    const int hi2 =  i1 >> 1;        /* step 2/3 upper bound */
++    const int hi4 = hi2 - 1;         /* step 4 upper bound */
++    const int st3 =  i0 >> 1;        /* step 3/4 lower bound */
++    float *scr = s->f_blockbuf;
++    float *mir;
++    int lp0, i, k;
+ 
+     if (!s->f_blockbuf)
+         return 0;
+ 
++    mir = scr + (size_t)O * F_DWT_BLOCK;
++
+     for (lp0 = 0; lp0 + F_DWT_BLOCK <= lh; lp0 += F_DWT_BLOCK) {
+-        /* gather the block's rows, replicating the scalar interleave exactly:
+-         * with l = line + mv, loop 1 places data rows 0..E-1 at line indices
+-         * 2mv+2j (even = low subband), loop 2 places the rest at 1+2(j-E)
+-         * (odd = high subband) — both independent of the parity of mv. */
+-        for (j = 0; j < E; j++)
+-            memcpy(rows + (ptrdiff_t)(2 * mv + 2 * j) * F_DWT_BLOCK,
+-                   data + (size_t)j * w + lp0,
+-                   F_DWT_BLOCK * sizeof(float));
+-        for (; j < lv; j++)
+-            memcpy(rows + (ptrdiff_t)(1 + 2 * (j - E)) * F_DWT_BLOCK,
+-                   data + (size_t)j * w + lp0,
+-                   F_DWT_BLOCK * sizeof(float));
++        const float *base = data + lp0;
++        float e1c[F_DWT_BLOCK], e1n[F_DWT_BLOCK];
++        float o2c[F_DWT_BLOCK], o2p[F_DWT_BLOCK];
++        float e3h[F_DWT_BLOCK], e3c[F_DWT_BLOCK];
++        float o4c[F_DWT_BLOCK];
++        float va[F_DWT_BLOCK], vb[F_DWT_BLOCK], vc[F_DWT_BLOCK];
++
++        /* high-subband rows: output writes can clobber these before they
++         * are read, low rows are always read before they are written */
++        for (i = E; i < lv; i++)
++            memcpy(scr + (size_t)(i - E) * F_DWT_BLOCK,
++                   base + (size_t)i * w, F_DWT_BLOCK * sizeof(float));
+ 
+         /* boundary mirroring, identical to extend97_float */
+         for (i = 1; i <= 4; i++) {
+-            memcpy(rows + (ptrdiff_t)(i0 - i) * F_DWT_BLOCK,
+-                   rows + (ptrdiff_t)(i0 + i) * F_DWT_BLOCK,
+-                   F_DWT_BLOCK * sizeof(float));
+-            memcpy(rows + (ptrdiff_t)(i1 + i - 1) * F_DWT_BLOCK,
+-                   rows + (ptrdiff_t)(i1 - i - 1) * F_DWT_BLOCK,
+-                   F_DWT_BLOCK * sizeof(float));
++            dwt97_ver_load(mir + (size_t)(4 - i) * F_DWT_BLOCK, base, scr,
++                           mir, w, i0, i1, E, i0 + i);
++            dwt97_ver_load(mir + (size_t)(3 + i) * F_DWT_BLOCK, base, scr,
++                           mir, w, i0, i1, E, i1 - i - 1);
+         }
+ 
+-        /* step 1, loop range identical to sr_1d97_float */
+-        for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 2; i++) {
+-            float *ry  = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
+-            float *ry1 = rows + (ptrdiff_t)(2 * i - 1) * F_DWT_BLOCK;
+-            float *ry2 = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
+-            for (k = 0; k < F_DWT_BLOCK; k++)
+-                ry[k] -= F_LFTG_DELTA * (ry1[k] + ry2[k]);
+-        }
+-        /* step 2 */
+-        for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 1; i++) {
+-            float *ry  = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
+-            float *ry1 = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
+-            float *ry2 = rows + (ptrdiff_t)(2 * i + 2) * F_DWT_BLOCK;
+-            for (k = 0; k < F_DWT_BLOCK; k++)
+-                ry[k] -= F_LFTG_GAMMA * (ry1[k] + ry2[k]);
+-        }
+-        /* step 3 */
+-        for (i = (i0 >> 1); i < (i1 >> 1) + 1; i++) {
+-            float *ry  = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
+-            float *ry1 = rows + (ptrdiff_t)(2 * i - 1) * F_DWT_BLOCK;
+-            float *ry2 = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
+-            for (k = 0; k < F_DWT_BLOCK; k++)
+-                ry[k] += F_LFTG_BETA * (ry1[k] + ry2[k]);
+-        }
+-        /* step 4 */
+-        for (i = (i0 >> 1); i < (i1 >> 1); i++) {
+-            float *ry  = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
+-            float *ry1 = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
+-            float *ry2 = rows + (ptrdiff_t)(2 * i + 2) * F_DWT_BLOCK;
+-            for (k = 0; k < F_DWT_BLOCK; k++)
+-                ry[k] += F_LFTG_ALPHA * (ry1[k] + ry2[k]);
++        /* E1[hi1], step 1's first value */
++        dwt97_ver_load(va, base, scr, mir, w, i0, i1, E, 2 * hi1 - 1);
++        dwt97_ver_load(vb, base, scr, mir, w, i0, i1, E, 2 * hi1);
++        dwt97_ver_load(vc, base, scr, mir, w, i0, i1, E, 2 * hi1 + 1);
++        for (k = 0; k < F_DWT_BLOCK; k++)
++            e1c[k] = vb[k] - F_LFTG_DELTA * (va[k] + vc[k]);
++        memset(e3h, 0, sizeof(e3h));
++
++        for (i = hi1; i >= lo; i--) {
++            if (i > lo) {
++                /* E1[i-1] and O2[i-1] */
++                dwt97_ver_load(va, base, scr, mir, w, i0, i1, E, 2 * i - 3);
++                dwt97_ver_load(vb, base, scr, mir, w, i0, i1, E, 2 * i - 2);
++                dwt97_ver_load(vc, base, scr, mir, w, i0, i1, E, 2 * i - 1);
++                for (k = 0; k < F_DWT_BLOCK; k++)
++                    e1n[k] = vb[k] - F_LFTG_DELTA * (va[k] + vc[k]);
++                for (k = 0; k < F_DWT_BLOCK; k++)
++                    o2p[k] = vc[k] - F_LFTG_GAMMA * (e1n[k] + e1c[k]);
++            }
++            /* E3[i] and O4[i], same ranges as the scalar steps 3 and 4 */
++            if (i >= st3 && i <= hi2)
++                for (k = 0; k < F_DWT_BLOCK; k++)
++                    e3c[k] = e1c[k] + F_LFTG_BETA * (o2p[k] + o2c[k]);
++            if (i >= st3 && i <= hi4)
++                for (k = 0; k < F_DWT_BLOCK; k++)
++                    o4c[k] = o2c[k] + F_LFTG_ALPHA * (e3c[k] + e3h[k]);
++
++            /* scatter: output row q - i0, rows outside the signal are the
++             * scalar pass's mirror slots and are not written */
++            if (2 * i >= i0 && 2 * i < i1)
++                memcpy(data + (size_t)(2 * i - i0) * w + lp0, e3c,
++                       F_DWT_BLOCK * sizeof(float));
++            if (2 * i + 1 >= i0 && 2 * i + 1 < i1)
++                memcpy(data + (size_t)(2 * i + 1 - i0) * w + lp0, o4c,
++                       F_DWT_BLOCK * sizeof(float));
++
++            if (i > lo) {
++                memcpy(e1c, e1n, sizeof(e1c));
++                memcpy(o2c, o2p, sizeof(o2c));
++            }
++            if (i >= st3 && i <= hi2)
++                memcpy(e3h, e3c, sizeof(e3h));
+         }
+-
+-        /* scatter: with l = line + mv, the scalar pass writes data row i from
+-         * line index mv+i, i in [0, lv) — i.e. signal rows [mv, mv+lv) */
+-        for (y = 0; y < lv; y++)
+-            memcpy(data + (size_t)y * w + lp0,
+-                   rows + (ptrdiff_t)(mv + y) * F_DWT_BLOCK,
+-                   F_DWT_BLOCK * sizeof(float));
+     }
+     return lp0;
+ }

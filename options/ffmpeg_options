@@ -1,0 +1,61 @@
+# FFmpeg options for the DCP build.
+#
+# This is the reference justsrc/mpv-builder nightly's option set minus the two
+# nonfree entries: --enable-nonfree and --enable-libfdk-aac are deliberately
+# absent, so every FFmpeg library reports GPL (version 3 or later) instead of
+# "nonfree and unredistributable". The custom libj2k decoder is added by
+# patches/ffmpeg/libj2k-wiring.patch. The linker paths for libj2k and the
+# frameworks its static Rust archive needs are appended by the workflow;
+# `--extra-cflags`/`--extra-ldflags` for Homebrew are supplied through the
+# workflow environment so both FFmpeg and mpv see the same paths.
+--enable-version3
+--enable-gpl
+--enable-pthreads
+--enable-runtime-cpudetect
+--enable-videotoolbox
+--enable-audiotoolbox
+--enable-libopus
+--enable-libvorbis
+--enable-libvpx
+--enable-libx264
+--enable-libx265
+--enable-libdav1d
+--enable-librav1e
+--enable-libsvtav1
+--enable-libaom
+--enable-libass
+--enable-libfreetype
+--enable-libfribidi
+--enable-libmp3lame
+--enable-fontconfig
+--enable-libbluray
+--enable-libxml2
+--enable-gnutls
+--enable-libsmbclient
+--enable-libssh
+--enable-libwebp
+--enable-libjxl
+--enable-libzimg
+--enable-libsnappy
+--enable-libvmaf
+--enable-libsoxr
+--enable-libmodplug
+--enable-libgme
+--enable-libvidstab
+--enable-libaribb24
+--enable-libharfbuzz
+--enable-libopencore-amrnb
+--enable-libopencore-amrwb
+--enable-libopenjpeg
+--enable-libqrencode
+--enable-librist
+--enable-librubberband
+--enable-libsrt
+--enable-libspeex
+--enable-libtesseract
+--enable-libtheora
+--enable-libxvid
+--enable-libzmq
+--enable-frei0r
+--enable-whisper
+--enable-libj2k

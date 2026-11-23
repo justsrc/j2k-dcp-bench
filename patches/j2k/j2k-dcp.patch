@@ -1,0 +1,789 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 053fea9..314fede 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2525,6 +2525,7 @@ name = "j2k-c"
+ version = "0.14.0"
+ dependencies = [
+  "j2k",
++ "j2k-metal",
+  "j2k-test-support",
+  "rayon",
+ ]
+diff --git a/crates/j2k-c/Cargo.toml b/crates/j2k-c/Cargo.toml
+index 80473a6..10c9a63 100644
+--- a/crates/j2k-c/Cargo.toml
++++ b/crates/j2k-c/Cargo.toml
+@@ -10,10 +10,16 @@ publish = false
+ 
+ [lib]
+ name = "j2k_c"
+-crate-type = ["cdylib", "rlib"]
++crate-type = ["cdylib", "rlib", "staticlib"]
++
++[features]
++# Fork addition: expose the Metal GPU decode backend through the C ABI. The
++# j2k_decoder_metal_* functions are only present in builds with this feature.
++metal = ["dep:j2k-metal"]
+ 
+ [dependencies]
+ j2k = { path = "../j2k" }
++j2k-metal = { path = "../j2k-metal", optional = true }
+ rayon = { workspace = true }
+ 
+ [dev-dependencies]
+diff --git a/crates/j2k-c/include/j2k.h b/crates/j2k-c/include/j2k.h
+index a3ba4df..8336a73 100644
+--- a/crates/j2k-c/include/j2k.h
++++ b/crates/j2k-c/include/j2k.h
+@@ -83,6 +83,19 @@ typedef uint32_t j2k_status;
+ #define J2K_COLOR_ICC UINT32_C(2)
+ #define J2K_COLOR_UNKNOWN UINT32_C(3)
+ 
++/* Fork additions. Transfer syntax classes reported by
++ * j2k_decoder_transfer_syntax. */
++#define J2K_SYNTAX_JPEG_BASELINE8 UINT32_C(0)
++#define J2K_SYNTAX_JPEG_EXTENDED UINT32_C(1)
++#define J2K_SYNTAX_JPEG_PROGRESSIVE UINT32_C(2)
++#define J2K_SYNTAX_JPEG_LOSSLESS UINT32_C(3)
++#define J2K_SYNTAX_JPEG_LOSSLESS_SV1 UINT32_C(4)
++#define J2K_SYNTAX_JPEG2000_LOSSLESS UINT32_C(5)
++#define J2K_SYNTAX_JPEG2000_LOSSY UINT32_C(6)
++#define J2K_SYNTAX_HT_JPEG2000_LOSSLESS UINT32_C(7)
++#define J2K_SYNTAX_HT_JPEG2000_LOSSY UINT32_C(8)
++#define J2K_SYNTAX_OTHER UINT32_C(9)
++
+ #define J2K_U8 UINT32_C(1)
+ #define J2K_U16_LE UINT32_C(2)
+ #define J2K_I16_LE UINT32_C(3)
+@@ -378,6 +391,60 @@ J2K_API j2k_status j2k_decoder_decode_rows(
+     uint32_t max_rows_per_stripe, j2k_row_callback callback, void *user_data,
+     j2k_output_info *out, j2k_error *error);
+ 
++/* Fork additions below: persistent-decoder feed, header-fact output layout,
++ * the core whole-image decode route, and the Metal GPU backend. They are
++ * additive to ABI 1 and only available in builds of this library that include
++ * them (the metal functions additionally require the `metal` feature). */
++
++/* Replaces the codestream the decoder holds, keeping its threads, session,
++ * settings, limits and Metal state. Same input checks as j2k_decoder_open.
++ * The new input is fully inspected before any state is replaced, so a failed
++ * feed keeps the previous codestream inspectable and decodable. */
++J2K_API j2k_status j2k_decoder_feed(
++    j2k_decoder *decoder, const uint8_t *input, size_t input_len,
++    j2k_error *error);
++
++/* The compressed transfer syntax class of the held codestream, one of the
++ * J2K_SYNTAX_* values. */
++J2K_API j2k_status j2k_decoder_transfer_syntax(
++    j2k_decoder *decoder, uint32_t *out_syntax, j2k_error *error);
++
++/* The native output layout of a full-image, full-resolution request, derived
++ * from header facts alone without batch-engine planning. Covers raw
++ * codestreams with one or three unsigned components of equal precision; any
++ * other request returns J2K_UNSUPPORTED (j2k_decoder_output_info stays the
++ * general route). */
++J2K_API j2k_status j2k_decoder_output_info_native(
++    j2k_decoder *decoder, const j2k_decode_options *options,
++    j2k_output_info *out, j2k_error *error);
++
++/* Decodes a full-image, full-resolution request through the core whole-image
++ * decoder, skipping the batch engine's per-image planning. For layouts
++ * j2k_decoder_output_info_native represents, the output bytes equal those of
++ * j2k_decoder_decode_into on the same codestream. Other requests return
++ * J2K_UNSUPPORTED. */
++J2K_API j2k_status j2k_decoder_decode_full_into(
++    j2k_decoder *decoder, const j2k_decode_options *options,
++    uint8_t *output, size_t output_len, size_t stride, j2k_error *error);
++
++/* Creates the decoder's Metal session as the availability gate for strict
++ * Metal decoding; idempotent. Returns J2K_UNSUPPORTED when Metal is
++ * unavailable on this host. The decode itself runs on the library's internal
++ * prepared-direct runtime. Requires the `metal` feature build of this
++ * library. */
++J2K_API j2k_status j2k_decoder_metal_init(
++    j2k_decoder *decoder, j2k_error *error);
++
++/* Decodes the full image at full resolution on the Metal GPU backend,
++ * strictly without CPU fallback, into a caller-owned strided buffer (same
++ * stride/span contract as j2k_decoder_decode_into). Every failure leaves the
++ * output untouched; no error substitutes CPU output for Metal output.
++ * Requires the `metal` feature build and a prior successful
++ * j2k_decoder_metal_init. */
++J2K_API j2k_status j2k_decoder_metal_decode_into(
++    j2k_decoder *decoder, const j2k_decode_options *options,
++    uint8_t *output, size_t output_len, size_t stride, j2k_error *error);
++
+ /* Encodes interleaved samples losslessly into a buffer this library allocates.
+  * The encoder decodes its result and compares it with the samples before
+  * returning it. On success *out and *out_len describe the encoded bytes;
+diff --git a/crates/j2k-c/include/j2k.hpp b/crates/j2k-c/include/j2k.hpp
+index 724b02d..4b2ceb6 100644
+--- a/crates/j2k-c/include/j2k.hpp
++++ b/crates/j2k-c/include/j2k.hpp
+@@ -239,6 +239,59 @@ public:
+         return result;
+     }
+ 
++    // Fork addition: replace this decoder's codestream, keeping its threads,
++    // session, settings, limits and Metal state.
++    void feed(const uint8_t *input, size_t length) {
++        j2k_error detail{};
++        check(j2k_decoder_feed(handle_, input, length, &detail), detail);
++    }
++
++    // Fork addition: the compressed transfer syntax class (J2K_SYNTAX_*).
++    uint32_t transfer_syntax() {
++        uint32_t result = J2K_SYNTAX_OTHER;
++        j2k_error detail{};
++        check(j2k_decoder_transfer_syntax(handle_, &result, &detail), detail);
++        return result;
++    }
++
++    // Fork addition: the native output layout of a full-image, full-resolution
++    // request, from header facts alone. Throws error with J2K_UNSUPPORTED for
++    // requests the core whole-image decoder does not represent.
++    j2k_output_info output_info_native(
++            const j2k_decode_options &options = J2K_DECODE_OPTIONS_INIT) {
++        j2k_output_info result = J2K_OUTPUT_INFO_INIT;
++        j2k_error detail{};
++        check(j2k_decoder_output_info_native(handle_, &options, &result, &detail), detail);
++        return result;
++    }
++
++    // Fork addition: decode the full image through the core whole-image
++    // decoder, without the batch engine's per-image planning.
++    void decode_full_into(uint8_t *output, size_t length, size_t stride,
++                          const j2k_decode_options &options = J2K_DECODE_OPTIONS_INIT) {
++        j2k_error detail{};
++        check(j2k_decoder_decode_full_into(handle_, &options, output, length, stride, &detail),
++              detail);
++    }
++
++    // Fork addition: create this decoder's Metal session as the availability
++    // gate for strict Metal decoding. Requires the `metal` feature build.
++    void metal_init() {
++        j2k_error detail{};
++        check(j2k_decoder_metal_init(handle_, &detail), detail);
++    }
++
++    // Fork addition: decode the full image on the Metal GPU backend, strictly
++    // without CPU fallback, through the library's internal prepared-direct
++    // runtime. Requires the `metal` feature build and a prior successful
++    // metal_init().
++    void metal_decode_into(uint8_t *output, size_t length, size_t stride,
++                           const j2k_decode_options &options = J2K_DECODE_OPTIONS_INIT) {
++        j2k_error detail{};
++        check(j2k_decoder_metal_decode_into(handle_, &options, output, length, stride, &detail),
++              detail);
++    }
++
+ private:
+     j2k_decoder *handle_ = nullptr;
+ };
+diff --git a/crates/j2k-c/src/abi.rs b/crates/j2k-c/src/abi.rs
+index 44daebd..9c1d19c 100644
+--- a/crates/j2k-c/src/abi.rs
++++ b/crates/j2k-c/src/abi.rs
+@@ -116,6 +116,27 @@ pub const J2K_COLOR_ICC: u32 = 2;
+ /// Colour specification: a COLR method this codec does not interpret (`value` holds it).
+ pub const J2K_COLOR_UNKNOWN: u32 = 3;
+ 
++/// Fork addition. Transfer syntax: baseline 8-bit JPEG.
++pub const J2K_SYNTAX_JPEG_BASELINE8: u32 = 0;
++/// Fork addition. Transfer syntax: sequential JPEG beyond the baseline.
++pub const J2K_SYNTAX_JPEG_EXTENDED: u32 = 1;
++/// Fork addition. Transfer syntax: progressive JPEG.
++pub const J2K_SYNTAX_JPEG_PROGRESSIVE: u32 = 2;
++/// Fork addition. Transfer syntax: lossless JPEG.
++pub const J2K_SYNTAX_JPEG_LOSSLESS: u32 = 3;
++/// Fork addition. Transfer syntax: lossless JPEG, predictor 1 subset.
++pub const J2K_SYNTAX_JPEG_LOSSLESS_SV1: u32 = 4;
++/// Fork addition. Transfer syntax: classic JPEG 2000, reversible coding.
++pub const J2K_SYNTAX_JPEG2000_LOSSLESS: u32 = 5;
++/// Fork addition. Transfer syntax: classic JPEG 2000, irreversible coding.
++pub const J2K_SYNTAX_JPEG2000_LOSSY: u32 = 6;
++/// Fork addition. Transfer syntax: HTJ2K (Part 15), reversible coding.
++pub const J2K_SYNTAX_HT_JPEG2000_LOSSLESS: u32 = 7;
++/// Fork addition. Transfer syntax: HTJ2K (Part 15), irreversible coding.
++pub const J2K_SYNTAX_HT_JPEG2000_LOSSY: u32 = 8;
++/// Fork addition. Transfer syntax: anything this ABI revision does not name.
++pub const J2K_SYNTAX_OTHER: u32 = 9;
++
+ /// Unsigned eight-bit samples.
+ pub const J2K_U8: u32 = 1;
+ /// Unsigned sixteen-bit samples, stored little-endian.
+diff --git a/crates/j2k-c/src/decoder.rs b/crates/j2k-c/src/decoder.rs
+index 515c3f6..a337900 100644
+--- a/crates/j2k-c/src/decoder.rs
++++ b/crates/j2k-c/src/decoder.rs
+@@ -8,18 +8,25 @@ use crate::{
+     abi::{
+         J2kCColorInfo, J2kCComponentInfo, J2kCDecodeOptions, J2kCImageInfo, J2kCOpenOptions,
+         J2kCOutputInfo, J2K_ALLOCATION_FAILED, J2K_ALPHA_NONE, J2K_ALPHA_PREMULTIPLIED,
+-        J2K_ALPHA_STRAIGHT, J2K_COLOR_ENUMERATED, J2K_COLOR_ICC, J2K_COLOR_NONE, J2K_COLOR_UNKNOWN,
+-        J2K_I16_LE, J2K_INVALID_INPUT, J2K_OPEN_FLAGS, J2K_OPEN_LENIENT, J2K_U16_LE, J2K_U8,
+-        J2K_UNSUPPORTED, J2K_WARNING_LENIENT_RECOVERY,
++        J2K_ALPHA_STRAIGHT, J2K_BUFFER_TOO_SMALL, J2K_COLOR_ENUMERATED, J2K_COLOR_ICC,
++        J2K_COLOR_NONE, J2K_COLOR_UNKNOWN, J2K_DECODE_FAILED, J2K_I16_LE, J2K_INVALID_INPUT,
++        J2K_OPEN_FLAGS, J2K_OPEN_LENIENT, J2K_SYNTAX_HT_JPEG2000_LOSSLESS,
++        J2K_SYNTAX_HT_JPEG2000_LOSSY, J2K_SYNTAX_JPEG2000_LOSSLESS, J2K_SYNTAX_JPEG2000_LOSSY,
++        J2K_SYNTAX_JPEG_BASELINE8, J2K_SYNTAX_JPEG_EXTENDED, J2K_SYNTAX_JPEG_LOSSLESS,
++        J2K_SYNTAX_JPEG_LOSSLESS_SV1, J2K_SYNTAX_JPEG_PROGRESSIVE, J2K_SYNTAX_OTHER, J2K_U16_LE,
++        J2K_U8, J2K_UNSUPPORTED, J2K_WARNING_LENIENT_RECOVERY,
+     },
+     error::{Error, Result},
+ };
+ use j2k::{
+-    BatchAlpha, BatchDecodeOptions, BatchLayout, CpuBatchDecoder, CpuBatchSamples, DecodeRequest,
+-    DecodeSettings, Downscale, EncodedImage, J2kColorSpec, J2kDecodeControl, J2kDecodeWarning,
+-    J2kDecoder, J2kReferenceGrid, J2kSupportInfo, NativeSampleType, PreparedBatch, Rect,
++    BackendRequest, BatchAlpha, BatchDecodeOptions, BatchLayout, CompressedTransferSyntax,
++    CpuBatchDecoder, CpuBatchSamples, DecodeRequest, DecodeSettings, Downscale, EncodedImage,
++    J2kColorSpec, J2kDecodeControl, J2kDecodeWarning, J2kDecoder, J2kReferenceGrid, J2kSupportInfo,
++    NativeSampleType, PixelFormat, PreparedBatch, Rect,
+ };
+ use std::{num::NonZeroUsize, sync::Arc};
++#[cfg(feature = "metal")]
++use j2k_metal::MetalBackendSession;
+ 
+ const DEFAULT_LIMIT: u64 = 512 * 1024 * 1024;
+ /// Most decode threads a decoder's own pool may have.
+@@ -38,6 +45,13 @@ pub(crate) struct Decoder {
+     prepared: Option<(DecodeRequest, PreparedBatch, J2kCOutputInfo)>,
+     pub(crate) operation_source: Option<crate::operations::OperationSource>,
+     max_output: u64,
++    /// The input limit this decoder enforces on every feed; set at open.
++    max_input: u64,
++    /// Fork addition: the decoder's Metal availability gate, created by
++    /// `j2k_decoder_metal_init`; the decode itself uses the library's
++    /// internal prepared-direct runtime.
++    #[cfg(feature = "metal")]
++    metal: Option<MetalBackendSession>,
+     pub(crate) poisoned: bool,
+ }
+ 
+@@ -113,10 +127,186 @@ impl Decoder {
+             } else {
+                 options.max_output_bytes
+             },
++            max_input: Self::input_limit(options)?,
++            #[cfg(feature = "metal")]
++            metal: None,
+             poisoned: false,
+         })
+     }
+ 
++    /// Fork addition: replace the codestream this decoder holds, keeping its
++    /// threads, session, settings, limits and Metal state. The new input is
++    /// fully inspected before any state is replaced, so a failed feed keeps
++    /// the previous codestream inspectable and decodable.
++    pub(crate) fn feed(&mut self, input: &[u8]) -> Result<()> {
++        if input.is_empty() {
++            return Err(Error::new(J2K_INVALID_INPUT, "encoded input is empty"));
++        }
++        if input.len() as u64 > self.max_input {
++            return Err(Error::limit("encoded input exceeds max_input_bytes"));
++        }
++        if !is_jpeg2000(input) {
++            return Err(Error::new(
++                J2K_INVALID_INPUT,
++                "input is not a JP2/JPH file or a raw JPEG 2000 codestream",
++            ));
++        }
++        let support = J2kDecoder::inspect_support_with_settings(input, self.settings)?;
++        let grid = J2kDecoder::inspect_reference_grid(input)?;
++        self.bytes = Arc::from(input);
++        self.support = support;
++        self.grid = grid;
++        self.prepared = None;
++        self.operation_source = None;
++        Ok(())
++    }
++
++    /// Fork addition: the compressed transfer syntax class of the held codestream.
++    pub(crate) fn transfer_syntax(&self) -> u32 {
++        match self.support.transfer_syntax {
++            CompressedTransferSyntax::JpegBaseline8 => J2K_SYNTAX_JPEG_BASELINE8,
++            CompressedTransferSyntax::JpegExtendedSequential => J2K_SYNTAX_JPEG_EXTENDED,
++            CompressedTransferSyntax::JpegProgressive => J2K_SYNTAX_JPEG_PROGRESSIVE,
++            CompressedTransferSyntax::JpegLossless => J2K_SYNTAX_JPEG_LOSSLESS,
++            CompressedTransferSyntax::JpegLosslessSv1 => J2K_SYNTAX_JPEG_LOSSLESS_SV1,
++            CompressedTransferSyntax::Jpeg2000Lossless => J2K_SYNTAX_JPEG2000_LOSSLESS,
++            CompressedTransferSyntax::Jpeg2000Lossy => J2K_SYNTAX_JPEG2000_LOSSY,
++            CompressedTransferSyntax::HtJpeg2000Lossless => J2K_SYNTAX_HT_JPEG2000_LOSSLESS,
++            CompressedTransferSyntax::HtJpeg2000Lossy => J2K_SYNTAX_HT_JPEG2000_LOSSY,
++            _ => J2K_SYNTAX_OTHER,
++        }
++    }
++
++    /// Fork addition: the native output layout of a full-image, full-resolution
++    /// request, derived from header facts alone — no batch-engine planning. The
++    /// layout is that of the core whole-image decoder: raw codestreams with one
++    /// or three unsigned components of equal precision. Any other request
++    /// returns `J2K_UNSUPPORTED` so callers keep `prepare`/`prepare_layout`
++    /// (the batch route) as their general path.
++    pub(crate) fn output_info_native(&self, options: J2kCDecodeOptions) -> Result<J2kCOutputInfo> {
++        if options.reserved != 0 {
++            return Err(Error::argument("reserved decode options must be zero"));
++        }
++        if [options.x, options.y, options.width, options.height, options.reduction] != [0; 5] {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "the native fast path covers the full image at full resolution",
++            ));
++        }
++        if self.support.file_metadata.is_some() {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "the native fast path covers raw codestreams; file-wrapped inputs use the general route",
++            ));
++        }
++        let (width, height) = self.support.info.dimensions;
++        let components = u32::from(self.support.component_count());
++        if components != 1 && components != 3 {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "the native fast path covers one or three interleaved components",
++            ));
++        }
++        let precision = self.uniform_precision()?;
++        let (sample_type, sample_bytes) = if precision <= 8 {
++            (J2K_U8, 1_u64)
++        } else {
++            (J2K_U16_LE, 2)
++        };
++        let row_bytes = u64::from(width) * u64::from(components) * sample_bytes;
++        let buffer_bytes = row_bytes
++            .checked_mul(u64::from(height))
++            .ok_or_else(|| Error::limit("output size overflow"))?;
++        if buffer_bytes > isize::MAX as u64 {
++            return Err(Error::limit("output exceeds the host address space"));
++        }
++        self.check_output_limit(buffer_bytes)?;
++        Ok(J2kCOutputInfo {
++            x: 0,
++            y: 0,
++            width,
++            height,
++            channels: components,
++            sample_type,
++            precision,
++            alpha: J2K_ALPHA_NONE,
++            row_bytes,
++            buffer_bytes,
++            warnings: 0,
++            ..Default::default()
++        })
++    }
++
++    /// The common bit depth of unsigned components; the core whole-image
++    /// decoder's interleaved output requires this.
++    fn uniform_precision(&self) -> Result<u32> {
++        if self.support.has_signed_components() {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "signed components are not representable in the native fast path",
++            ));
++        }
++        let first = self
++            .support
++            .components
++            .first()
++            .ok_or_else(|| Error::internal("codestream has no components"))?;
++        let precision = u32::from(first.bit_depth);
++        if self
++            .support
++            .components
++            .iter()
++            .any(|component| u32::from(component.bit_depth) != precision)
++        {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "components of mixed precision are not representable in the native fast path",
++            ));
++        }
++        Ok(precision)
++    }
++
++    /// Fork addition: decode a full-image, full-resolution request through the
++    /// core whole-image decoder, skipping the batch engine's per-image
++    /// planning. For representable layouts this delivers exactly the bytes the
++    /// batch route's core delegation delivers: the same decoder constructor,
++    /// format and stride contract.
++    pub(crate) fn decode_full_core(
++        &mut self,
++        options: J2kCDecodeOptions,
++        output: &mut [u8],
++        stride: usize,
++    ) -> Result<J2kCOutputInfo> {
++        let info = self.output_info_native(options)?;
++        let required = self.output_span(info, stride)?;
++        if output.len() < required {
++            return Err(Error::new(
++                J2K_BUFFER_TOO_SMALL,
++                "output buffer is shorter than the requested strided image",
++            ));
++        }
++        let fmt = core_pixel_format(&info).ok_or_else(|| {
++            Error::new(J2K_UNSUPPORTED, "core full decode does not represent this layout")
++        })?;
++        let bytes = Arc::clone(&self.bytes);
++        let settings = self.settings;
++        let outcome = in_pool(self.pool.as_ref(), move || {
++            let mut decoder = j2k::J2kDecoder::new_with_settings(&bytes, settings)?;
++            decoder.decode_into(output, stride, fmt)
++        })
++        .map_err(|error| Error::codec(&error))?;
++        if !outcome
++            .warnings
++            .iter()
++            .all(|warning| self.allows(*warning))
++        {
++            return Err(Error::internal(
++                "decode reported a warning its settings do not allow",
++            ));
++        }
++        Ok(info)
++    }
++
+     pub(crate) fn info(&self) -> J2kCImageInfo {
+         J2kCImageInfo {
+             width: self.support.info.dimensions.0,
+@@ -339,11 +529,36 @@ impl Decoder {
+     }
+ 
+     pub(crate) fn decode_prepared(&mut self, output: &mut [u8], stride: usize) -> Result<()> {
+-        let (_, prepared, info) = self
++        let (request, prepared, info) = self
+             .prepared
+             .as_ref()
+             .ok_or_else(|| Error::internal("decode requires a prepared request"))?;
+         let Self { session, pool, .. } = self;
++        // A lone full-image decode parallelizes better on the core whole-image
++        // decoder than on the batch engine, which plans for streams of images.
++        // Route representable full-image requests there; everything else keeps
++        // the batch route. Both routes deliver the same interleaved samples.
++        if matches!(request, DecodeRequest::Full) {
++            if let Some(fmt) = core_pixel_format(info) {
++                let bytes = Arc::clone(&self.bytes);
++                let settings = self.settings;
++                let outcome = in_pool(pool.as_ref(), move || {
++                    let mut decoder = j2k::J2kDecoder::new_with_settings(&bytes, settings)?;
++                    decoder.decode_into(output, stride, fmt)
++                })
++                .map_err(|error| Error::codec(&error))?;
++                if !outcome
++                    .warnings
++                    .iter()
++                    .all(|warning| self.allows(*warning))
++                {
++                    return Err(Error::internal(
++                        "decode reported a warning its settings do not allow",
++                    ));
++                }
++                return Ok(());
++            }
++        }
+         let result = in_pool(pool.as_ref(), || session.decode_prepared(prepared))
+             .map_err(Error::infrastructure)?;
+         if let Some(error) = result.errors().first() {
+@@ -375,6 +590,87 @@ impl Decoder {
+     }
+ }
+ 
++#[cfg(feature = "metal")]
++impl Decoder {
++    /// Fork addition: create the decoder's persistent Metal session. Idempotent;
++    /// `J2K_UNSUPPORTED` when Metal is unavailable on this host. The session
++    /// serves as the explicit availability gate for strict Metal decoding; the
++    /// decode itself runs on the library's internal prepared-direct runtime,
++    /// which measures faster than executing through a caller-owned session.
++    pub(crate) fn metal_init(&mut self) -> Result<()> {
++        if self.metal.is_none() {
++            let session = MetalBackendSession::system_default()
++                .map_err(|error| Error::new(J2K_UNSUPPORTED, error.to_string()))?;
++            self.metal = Some(session);
++        }
++        Ok(())
++    }
++
++    /// Fork addition: decode the full image at full resolution on the Metal
++    /// GPU backend, strictly without CPU fallback, into a caller-owned strided
++    /// buffer. Every failure leaves the output untouched. Returns the native
++    /// layout the decode used. The request routes through the library's
++    /// prepared-direct runtime — its fastest Metal path, measured ~2× faster
++    /// than executing through a caller-owned session — and an explicit Metal
++    /// request is still rejected when the layout is unrepresentable, so no
++    /// error path ever substitutes CPU output for Metal output.
++    pub(crate) fn metal_decode_full(
++        &mut self,
++        options: J2kCDecodeOptions,
++        output: &mut [u8],
++        stride: usize,
++    ) -> Result<J2kCOutputInfo> {
++        if self.metal.is_none() {
++            return Err(Error::new(
++                J2K_UNSUPPORTED,
++                "the Metal backend is not initialized",
++            ));
++        }
++        let info = self.output_info_native(options)?;
++        let required = self.output_span(info, stride)?;
++        if output.len() < required {
++            return Err(Error::new(
++                J2K_BUFFER_TOO_SMALL,
++                "output buffer is shorter than the requested strided image",
++            ));
++        }
++        let fmt = core_pixel_format(&info).ok_or_else(|| {
++            Error::new(J2K_UNSUPPORTED, "Metal decode does not represent this layout")
++        })?;
++        let bytes = Arc::clone(&self.bytes);
++        let request = j2k_metal::MetalDecodeRequest::full(fmt, BackendRequest::Metal);
++        let surface = {
++            let mut decoder =
++                j2k_metal::J2kDecoder::new(&bytes).map_err(|error| metal_error(&error))?;
++            decoder
++                .decode_request_to_device(request)
++                .map_err(|error| metal_error(&error))?
++        };
++        surface
++            .download_into(&mut output[..required], stride)
++            .map_err(|error| metal_error(&error))?;
++        Ok(info)
++    }
++}
++
++/// Fork addition: map a Metal backend failure to the C ABI status codes.
++#[cfg(feature = "metal")]
++fn metal_error(error: &j2k_metal::Error) -> Error {
++    let message = error.to_string();
++    let code = match error {
++        j2k_metal::Error::Decode(source) => return Error::codec(source),
++        j2k_metal::Error::BatchInfrastructure(source) => {
++            return Error::infrastructure(source.clone())
++        }
++        j2k_metal::Error::Buffer(_) => J2K_BUFFER_TOO_SMALL,
++        j2k_metal::Error::UnsupportedBackend { .. }
++        | j2k_metal::Error::UnsupportedMetalRequest { .. }
++        | j2k_metal::Error::MetalUnavailable => J2K_UNSUPPORTED,
++        _ => J2K_DECODE_FAILED,
++    };
++    Error::new(code, message)
++}
++
+ impl Decoder {
+     /// Whether this decoder's settings permit a decode to report `warning`:
+     /// a lenient decoder its metadata recoveries, a strict one nothing.
+@@ -443,6 +739,24 @@ fn decode_request(options: J2kCDecodeOptions) -> Result<DecodeRequest> {
+     })
+ }
+ 
++/// The core decoder's whole-image pixel format matching a native C output
++/// layout, or `None` when the core whole-image path cannot represent it
++/// (premultiplied alpha, unusual channel counts) and the batch route must run.
++fn core_pixel_format(info: &J2kCOutputInfo) -> Option<PixelFormat> {
++    match (info.channels, info.sample_type, info.alpha) {
++        (1, J2K_U8, J2K_ALPHA_NONE) => Some(PixelFormat::Gray8),
++        (1, J2K_U16_LE, J2K_ALPHA_NONE) => Some(PixelFormat::Gray16),
++        (1, J2K_I16_LE, J2K_ALPHA_NONE) => Some(PixelFormat::GrayI16),
++        (3, J2K_U8, J2K_ALPHA_NONE) => Some(PixelFormat::Rgb8),
++        (3, J2K_U16_LE, J2K_ALPHA_NONE) => Some(PixelFormat::Rgb16),
++        (3, J2K_I16_LE, J2K_ALPHA_NONE) => Some(PixelFormat::RgbI16),
++        (4, J2K_U8, J2K_ALPHA_STRAIGHT) => Some(PixelFormat::Rgba8),
++        (4, J2K_U16_LE, J2K_ALPHA_STRAIGHT) => Some(PixelFormat::Rgba16),
++        (4, J2K_I16_LE, J2K_ALPHA_STRAIGHT) => Some(PixelFormat::RgbaI16),
++        _ => None,
++    }
++}
++
+ pub(crate) fn native_output_info(
+     info: &j2k::BatchGroupInfo,
+     rect: Rect,
+diff --git a/crates/j2k-c/src/ffi.rs b/crates/j2k-c/src/ffi.rs
+index 5b80efd..466e7b6 100644
+--- a/crates/j2k-c/src/ffi.rs
++++ b/crates/j2k-c/src/ffi.rs
+@@ -479,6 +479,181 @@ pub unsafe extern "C" fn j2k_decoder_decode_into(
+     }
+ }
+ 
++/// Fork addition: replace the codestream a persistent decoder holds, keeping
++/// its threads, session, settings, limits and Metal state. Inspection fully
++/// validates the new input before any state is replaced, so a failed feed
++/// keeps the previous codestream inspectable and decodable. The same limits
++/// and signature checks as [`j2k_decoder_open`] apply.
++///
++/// # Safety
++/// The decoder must be live and exclusively used. `input` must cover
++/// `input_len` readable bytes and must not overlap decoder storage. `error`
++/// follows [`j2k_decoder_output_info`].
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_feed(
++    decoder: *mut J2kCDecoder,
++    input: *const u8,
++    input_len: usize,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller provides the readable input documented above; lengths are
++    // checked before any byte is read.
++    unsafe {
++        boundary(error, || {
++            check_bytes(input, input_len)?;
++            if input_len == 0 {
++                return Err(Error::new(J2K_INVALID_INPUT, "encoded input is empty"));
++            }
++            with_decoder(decoder, |state| {
++                state.feed(slice::from_raw_parts(input, input_len))
++            })
++        })
++    }
++}
++
++/// Fork addition: the compressed transfer syntax class of the held codestream,
++/// one of the `J2K_SYNTAX_*` values.
++///
++/// # Safety
++/// The decoder must be live and exclusively used. `out` must be a writable,
++/// aligned `uint32_t` slot, disjoint from decoder storage. `error` follows
++/// [`j2k_decoder_output_info`].
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_transfer_syntax(
++    decoder: *mut J2kCDecoder,
++    out: *mut u32,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller provides the writable slot documented above.
++    unsafe {
++        boundary(error, || {
++            check_pointer(out)?;
++            with_decoder(decoder, |state| {
++                out.write(state.transfer_syntax());
++                Ok(())
++            })
++        })
++    }
++}
++
++/// Fork addition: the native output layout of a full-image, full-resolution
++/// request, derived from header facts alone without the batch engine's
++/// per-image planning. Covers raw codestreams with one or three unsigned
++/// components of equal precision; any other request returns `J2K_UNSUPPORTED`
++/// and callers keep [`j2k_decoder_output_info`] as their general route.
++///
++/// # Safety
++/// Same requirements as [`j2k_decoder_output_info`].
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_output_info_native(
++    decoder: *mut J2kCDecoder,
++    options: *const J2kCDecodeOptions,
++    out: *mut J2kCOutputInfo,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller supplies live disjoint storage; prefixes are validated first.
++    unsafe {
++        boundary(error, || {
++            validate_struct(out)?;
++            let options = read_options(options)?;
++            with_decoder(decoder, |state| {
++                out.write(state.output_info_native(options)?);
++                Ok(())
++            })
++        })
++    }
++}
++
++/// Fork addition: decode a full-image, full-resolution request through the
++/// core whole-image decoder, skipping the batch engine's per-image planning.
++/// For layouts [`j2k_decoder_output_info_native`] represents, the output bytes
++/// equal those of [`j2k_decoder_decode_into`] on the same codestream. Any
++/// other request returns `J2K_UNSUPPORTED`.
++///
++/// # Safety
++/// Same requirements as [`j2k_decoder_decode_into`].
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_decode_full_into(
++    decoder: *mut J2kCDecoder,
++    options: *const J2kCDecodeOptions,
++    output: *mut u8,
++    output_len: usize,
++    stride: usize,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller owns the destination and handle; sizes are validated
++    // before a mutable slice is formed.
++    unsafe {
++        boundary(error, || {
++            let options = read_options(options)?;
++            check_bytes(output, output_len)?;
++            with_decoder(decoder, |state| {
++                state.decode_full_core(
++                    options,
++                    slice::from_raw_parts_mut(output, output_len),
++                    stride,
++                )?;
++                Ok(())
++            })
++        })
++    }
++}
++
++/// Fork addition: create the decoder's persistent Metal session. Idempotent;
++/// `J2K_UNSUPPORTED` when Metal is unavailable on this host. Only present in
++/// builds with the `metal` feature.
++///
++/// # Safety
++/// The decoder must be live and exclusively used. `error` follows
++/// [`j2k_decoder_output_info`].
++#[cfg(feature = "metal")]
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_metal_init(
++    decoder: *mut J2kCDecoder,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller guarantees a live, exclusively used decoder handle.
++    unsafe {
++        boundary(error, || with_decoder(decoder, |state| state.metal_init()))
++    }
++}
++
++/// Fork addition: decode the full image at full resolution on the Metal GPU
++/// backend, strictly without CPU fallback, into a caller-owned strided buffer.
++/// Every failure leaves the output untouched and returns a `J2K_*` status; no
++/// error ever substitutes CPU output for Metal output. Only present in builds
++/// with the `metal` feature.
++///
++/// # Safety
++/// Same requirements as [`j2k_decoder_decode_into`].
++#[cfg(feature = "metal")]
++#[no_mangle]
++pub unsafe extern "C" fn j2k_decoder_metal_decode_into(
++    decoder: *mut J2kCDecoder,
++    options: *const J2kCDecodeOptions,
++    output: *mut u8,
++    output_len: usize,
++    stride: usize,
++    error: *mut J2kCError,
++) -> u32 {
++    // SAFETY: Caller owns the destination and handle; sizes are validated
++    // before a mutable slice is formed.
++    unsafe {
++        boundary(error, || {
++            let options = read_options(options)?;
++            check_bytes(output, output_len)?;
++            with_decoder(decoder, |state| {
++                state.metal_decode_full(
++                    options,
++                    slice::from_raw_parts_mut(output, output_len),
++                    stride,
++                )?;
++                Ok(())
++            })
++        })
++    }
++}
++
+ /// `j2k_row_callback`: receives one row of `row_bytes` bytes at `row`, valid
+ /// only during the call. Returns zero to continue and nonzero to stop.
+ pub type J2kCRowCallback = Option<

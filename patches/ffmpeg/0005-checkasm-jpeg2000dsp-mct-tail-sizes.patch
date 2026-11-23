@@ -1,0 +1,104 @@
+From e512c98c09a1bca195f7fbc8d01791a2b2cfa023 Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:14:45 +0530
+Subject: [PATCH 05/11] checkasm/jpeg2000dsp: exercise MCT tail sizes
+
+The existing test only uses a size that is a multiple of four, so the
+NEON ICT and RCT scalar tails are never exercised. Exercise both
+kernels at sizes from zero through BUF_SIZE.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ tests/checkasm/jpeg2000dsp.c | 58 ++++++++++++++++++++++++++----------
+ 1 file changed, 42 insertions(+), 16 deletions(-)
+
+diff --git a/tests/checkasm/jpeg2000dsp.c b/tests/checkasm/jpeg2000dsp.c
+index c9158ab3de..14958cd40f 100644
+--- a/tests/checkasm/jpeg2000dsp.c
++++ b/tests/checkasm/jpeg2000dsp.c
+@@ -41,6 +41,11 @@
+             src[i] = (float)rnd() / (UINT_MAX >> 5); \
+     } while (0)
+ 
++static const int mct_sizes[] = {
++    0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33,
++    63, 64, 65, 127, 128, 129, 255, 256, 257, 511, BUF_SIZE
++};
++
+ static void check_rct_int(void)
+ {
+     LOCAL_ALIGNED_32(int32_t, src, [BUF_SIZE*3]);
+@@ -49,18 +54,28 @@ static void check_rct_int(void)
+     int32_t *ref0 = &ref[BUF_SIZE*0], *new0 = &new[BUF_SIZE*0];
+     int32_t *ref1 = &ref[BUF_SIZE*1], *new1 = &new[BUF_SIZE*1];
+     int32_t *ref2 = &ref[BUF_SIZE*2], *new2 = &new[BUF_SIZE*2];
++    size_t n;
+ 
+     declare_func(void, void *src0, void *src1, void *src2, int csize);
+ 
++    for (n = 0; n < FF_ARRAY_ELEMS(mct_sizes); n++) {
++        int csize = mct_sizes[n];
++
++        randomize_buffers();
++        memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
++        memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
++        call_ref(ref0, ref1, ref2, csize);
++        call_new(new0, new1, new2, csize);
++        /* Both buffers start identical, so this also catches writes past
++         * csize in the vector and tail loops. */
++        if (memcmp(ref0, new0, BUF_SIZE * sizeof(*src)) ||
++            memcmp(ref1, new1, BUF_SIZE * sizeof(*src)) ||
++            memcmp(ref2, new2, BUF_SIZE * sizeof(*src))) {
++            fprintf(stderr, "csize=%d\n", csize);
++            fail();
++        }
++    }
+     randomize_buffers();
+-    memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
+-    memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+-    call_ref(ref0, ref1, ref2, BUF_SIZE);
+-    call_new(new0, new1, new2, BUF_SIZE);
+-    if (memcmp(ref0, new0, BUF_SIZE * sizeof(*src)) ||
+-        memcmp(ref1, new1, BUF_SIZE * sizeof(*src)) ||
+-        memcmp(ref2, new2, BUF_SIZE * sizeof(*src)))
+-        fail();
+     memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+     bench_new(new0, new1, new2, BUF_SIZE);
+ }
+@@ -74,17 +89,28 @@ static void check_ict_float(void)
+     float *ref1 = &ref[BUF_SIZE*1], *new1 = &new[BUF_SIZE*1];
+     float *ref2 = &ref[BUF_SIZE*2], *new2 = &new[BUF_SIZE*2];
+ 
++    size_t n;
++
+     declare_func(void, void *src0, void *src1, void *src2, int csize);
+ 
++    for (n = 0; n < FF_ARRAY_ELEMS(mct_sizes); n++) {
++        int csize = mct_sizes[n];
++
++        randomize_buffers_float();
++        memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
++        memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
++        call_ref(ref0, ref1, ref2, csize);
++        call_new(new0, new1, new2, csize);
++        /* Both buffers start identical, so this also catches writes past
++         * csize in the vector and tail loops. */
++        if (!float_near_abs_eps_array(ref0, new0, 1.0e-5, BUF_SIZE) ||
++            !float_near_abs_eps_array(ref1, new1, 1.0e-5, BUF_SIZE) ||
++            !float_near_abs_eps_array(ref2, new2, 1.0e-5, BUF_SIZE)) {
++            fprintf(stderr, "csize=%d\n", csize);
++            fail();
++        }
++    }
+     randomize_buffers_float();
+-    memcpy(ref, src, BUF_SIZE * 3 * sizeof(*src));
+-    memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+-    call_ref(ref0, ref1, ref2, BUF_SIZE);
+-    call_new(new0, new1, new2, BUF_SIZE);
+-    if (!float_near_abs_eps_array(ref0, new0, 1.0e-5, BUF_SIZE) ||
+-        !float_near_abs_eps_array(ref1, new1, 1.0e-5, BUF_SIZE) ||
+-        !float_near_abs_eps_array(ref2, new2, 1.0e-5, BUF_SIZE))
+-        fail();
+     memcpy(new, src, BUF_SIZE * 3 * sizeof(*src));
+     bench_new(new0, new1, new2, BUF_SIZE);
+ }

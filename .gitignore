@@ -1,0 +1,15 @@
+# Build outputs (root-anchored: patches/j2k must stay tracked)
+/dist/
+/build/
+/mpv-build/
+/j2k/
+/target/
+*.zip
+*.log
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+.env.*

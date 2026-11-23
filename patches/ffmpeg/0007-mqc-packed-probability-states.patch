@@ -1,0 +1,328 @@
+From 570be8078330fa4eec0b4ed2e0fab99934ff19d7 Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:57:52 +0530
+Subject: [PATCH 07/11] avcodec/mqc: decode symbols from packed probability
+ states
+
+Each symbol currently loads Qe, the MPS and the next state from three
+tables, and renormalization shifts the 32-bit C register one bit at a
+time. Pack the four values into one table entry, hold C and up to 48
+bits of read-ahead in a 64-bit register, and renormalize once for all
+the shifts the read-ahead covers. The raw (bypass) segments keep the
+32-bit byte input they need.
+
+The tier-1 loops call this for every coded coefficient, so the state
+stays caller-local and the decision is branchless: the two exchanges
+differ only in which side of the comparison selects the next state.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ libavcodec/mqc.c    |  31 ++++++++++
+ libavcodec/mqc.h    | 137 ++++++++++++++++++++++++++++++++++++++++++++
+ libavcodec/mqcdec.c |  78 ++++---------------------
+ 3 files changed, 180 insertions(+), 66 deletions(-)
+
+diff --git a/libavcodec/mqc.c b/libavcodec/mqc.c
+index 6f7088ec48..0226001473 100644
+--- a/libavcodec/mqc.c
++++ b/libavcodec/mqc.c
+@@ -61,6 +61,37 @@ const uint8_t ff_mqc_nmps[2 * 47] = {
+     82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 90, 91, 92, 93
+ };
+ 
++/*
++ * Qe, MPS, next-MPS and next-LPS state of each context state, packed so the
++ * decoder reads all four with one 32-bit load.
++ */
++const uint32_t ff_mqc_packed[2 * 47] = {
++    0x03045601, 0x02075601, 0x0c083401, 0x0d0b3401,
++    0x120c1801, 0x130f1801, 0x18100ac1, 0x19130ac1,
++    0x3a140521, 0x3b170521, 0x42980221, 0x439b0221,
++    0x0d1c5601, 0x0c1f5601, 0x1c205401, 0x1d235401,
++    0x1c244801, 0x1d274801, 0x1c283801, 0x1d2b3801,
++    0x222c3001, 0x232f3001, 0x24302401, 0x25332401,
++    0x28341c01, 0x29371c01, 0x2a741601, 0x2b771601,
++    0x1d3c5601, 0x1c3f5601, 0x1c405401, 0x1d435401,
++    0x1e445101, 0x1f475101, 0x20484801, 0x214b4801,
++    0x224c3801, 0x234f3801, 0x24503401, 0x25533401,
++    0x26543001, 0x27573001, 0x26582801, 0x275b2801,
++    0x285c2401, 0x295f2401, 0x2a602201, 0x2b632201,
++    0x2c641c01, 0x2d671c01, 0x2e681801, 0x2f6b1801,
++    0x306c1601, 0x316f1601, 0x32701401, 0x33731401,
++    0x34741201, 0x35771201, 0x36781101, 0x377b1101,
++    0x387c0ac1, 0x397f0ac1, 0x3a8009c1, 0x3b8309c1,
++    0x3c8408a1, 0x3d8708a1, 0x3e880521, 0x3f8b0521,
++    0x408c0441, 0x418f0441, 0x429002a1, 0x439302a1,
++    0x44940221, 0x45970221, 0x46980141, 0x479b0141,
++    0x489c0111, 0x499f0111, 0x4aa00085, 0x4ba30085,
++    0x4ca40049, 0x4da70049, 0x4ea80025, 0x4fab0025,
++    0x50ac0015, 0x51af0015, 0x52b00009, 0x53b30009,
++    0x54b40005, 0x55b70005, 0x56b40001, 0x57b70001,
++    0x5cb85601, 0x5dbb5601,
++};
++
+ void ff_mqc_init_contexts(MqcState *mqc)
+ {
+     memset(mqc->cx_states, 0, sizeof(mqc->cx_states));
+diff --git a/libavcodec/mqc.h b/libavcodec/mqc.h
+index 5e782b05f9..e391edf270 100644
+--- a/libavcodec/mqc.h
++++ b/libavcodec/mqc.h
+@@ -30,6 +30,9 @@
+ 
+ #include <stdint.h>
+ 
++#include "libavutil/attributes.h"
++#include "libavutil/intmath.h"
++
+ #define MQC_CX_UNI 17
+ #define MQC_CX_RL  18
+ 
+@@ -37,6 +40,13 @@ extern const uint16_t ff_mqc_qe[2 * 47];
+ extern const uint8_t  ff_mqc_nlps[2 * 47];
+ extern const uint8_t  ff_mqc_nmps[2 * 47];
+ 
++/*
++ * Probability states packed for the decoder so that one load yields the
++ * value, the MPS and both transitions: Qe in bits 0-15, MPS in bit 16, the
++ * next MPS state in bits 17-23 and the next LPS state in bits 24-30.
++ */
++extern const uint32_t ff_mqc_packed[2 * 47];
++
+ typedef struct MqcState {
+     uint8_t *bp, *bpstart;
+     unsigned int a;
+@@ -44,8 +54,135 @@ typedef struct MqcState {
+     unsigned int ct;
+     uint8_t cx_states[19];
+     int raw;
++    uint64_t c64;    ///< decoder C-register: code value in bits 48-63, read-ahead below
++    unsigned shift_count; ///< valid read-ahead bits below the code value
+ } MqcState;
+ 
++/*
++ * Decoder. In MQ mode the C-register holds the code value in bits 48-63 and
++ * up to 48 bits of read-ahead below it, so renormalization shifts once for
++ * all the bits it needs instead of once per bit, and the symbol decision is
++ * branchless. This is the form used by T.88 Annex G.
++ *
++ * The tier-1 loops call this millions of times per frame; with the state in
++ * a caller-local MqcState the compiler keeps C, A and the byte pointer in
++ * registers instead of reloading them around a cross-TU call.
++ */
++static av_always_inline void ff_mqc_bytein_inline(MqcState *mqc)
++{
++    /* BYTEIN, repeated while another byte fits below the code value. A byte
++     * after 0xFF may carry into the bits above it, so it is only read once no
++     * read-ahead bits remain; any other byte lands on zero bits and can be
++     * read early without changing what the cell sees. */
++    while (mqc->shift_count <= 40) {
++        if (*mqc->bp == 0xff) {
++            if (mqc->bp[1] > 0x8f) {
++                mqc->shift_count += 8;
++            } else if (!mqc->shift_count) {
++                mqc->bp++;
++                mqc->c64 += (0x7fULL << 41) - ((uint64_t)*mqc->bp << 41);
++                mqc->shift_count = 7;
++            } else
++                break;
++        } else {
++            mqc->bp++;
++            mqc->c64 += (uint64_t)(*mqc->bp ^ 0xff) << (40 - mqc->shift_count);
++            mqc->shift_count += 8;
++        }
++    }
++}
++
++/* RENORMD: shift A back to at least 0x8000, batching the shifts the
++ * read-ahead bits cover. */
++static av_always_inline void ff_mqc_renorm_inline(MqcState *mqc)
++{
++    while (!(mqc->a & 0x8000)) {
++        unsigned shift;
++
++        ff_mqc_bytein_inline(mqc);
++        shift = ff_clz(mqc->a) - 16;
++        if (shift > mqc->shift_count)
++            shift = mqc->shift_count;
++        mqc->a       <<= shift;
++        mqc->c64     <<= shift;
++        mqc->shift_count -= shift;
++    }
++}
++
++/* Byte input of the 32-bit C-register, kept for the raw (bypass) segments. */
++static av_always_inline void ff_mqc_bytein32_inline(MqcState *mqc)
++{
++    if (*mqc->bp == 0xff) {
++        if (*(mqc->bp + 1) > 0x8f)
++            mqc->c++;
++        else {
++            mqc->bp++;
++            mqc->c += 2 + 0xfe00 - (*mqc->bp << 9);
++        }
++    } else {
++        mqc->bp++;
++        mqc->c += 1 + 0xff00 - (*mqc->bp << 8);
++    }
++}
++
++static av_always_inline int ff_mqc_decode_bypass_inline(MqcState *mqc)
++{
++    int bit = !(mqc->c & 0x40000000);
++
++    if (!(mqc->c & 0xff)) {
++        mqc->c -= 0x100;
++        ff_mqc_bytein32_inline(mqc);
++    }
++    mqc->c += mqc->c;
++
++    return bit;
++}
++
++static av_always_inline int ff_mqc_decode_inline(MqcState *mqc,
++                                                 uint8_t *cxstate)
++{
++    uint32_t state, qe, a, is_lps, mask, cond, pick_nlps;
++    uint64_t mask64;
++    unsigned shift;
++    uint8_t *cx = cxstate;
++
++    if (mqc->raw)
++        return ff_mqc_decode_bypass_inline(mqc);
++
++    state = ff_mqc_packed[*cx];
++    qe    = state & 0xffff;
++    a     = mqc->a - qe;
++
++    /* The MPS/LPS decision, MPS_EXCHANGE and LPS_EXCHANGE of C.3.2, without
++     * branches: both exchanges differ only in whether the condition flips
++     * the role of the exchange, so one XOR handles both. */
++    is_lps = (mqc->c64 >> 48) >= a;
++    mask   = 0 - is_lps;
++    mask64 = 0 - (uint64_t)is_lps;
++    mqc->c64 -= ((uint64_t)a << 48) & mask64;
++    mqc->a    = (a & ~mask) | (qe & mask);
++
++    cond      = a < qe;
++    pick_nlps = cond ^ is_lps;
++    /* A probability-state transition happens exactly when A renormalizes:
++     * on every LPS, and on an MPS that leaves A below 0x8000. */
++    *cx = (is_lps | (a < 0x8000))
++        ? (state >> (17 + 7 * pick_nlps)) & 0x7f
++        : *cx;
++
++    /* Zero shifts in the common case, where A >= 0x8000 already. */
++    shift = ff_clz(mqc->a) - 16;
++    if (shift <= mqc->shift_count) {
++        mqc->a       <<= shift;
++        mqc->c64     <<= shift;
++        mqc->shift_count -= shift;
++    } else {
++        ff_mqc_renorm_inline(mqc);
++    }
++
++    return ((state >> 16) & 1) ^ pick_nlps;
++}
++
+ /* encoder */
+ 
+ /** initialize the encoder */
+diff --git a/libavcodec/mqcdec.c b/libavcodec/mqcdec.c
+index 34aa51951e..126bfb1e4d 100644
+--- a/libavcodec/mqcdec.c
++++ b/libavcodec/mqcdec.c
+@@ -27,81 +27,27 @@
+ 
+ #include "mqc.h"
+ 
+-static void bytein(MqcState *mqc)
+-{
+-    if (*mqc->bp == 0xff) {
+-        if (*(mqc->bp + 1) > 0x8f)
+-            mqc->c++;
+-        else {
+-            mqc->bp++;
+-            mqc->c += 2 + 0xfe00 - (*mqc->bp << 9);
+-        }
+-    } else {
+-        mqc->bp++;
+-        mqc->c += 1 + 0xff00 - (*mqc->bp << 8);
+-    }
+-}
+-
+-static int exchange(MqcState *mqc, uint8_t *cxstate, int lps)
+-{
+-    int d;
+-    if ((mqc->a < ff_mqc_qe[*cxstate]) ^ (!lps)) {
+-        if (lps)
+-            mqc->a = ff_mqc_qe[*cxstate];
+-        d = *cxstate & 1;
+-        *cxstate = ff_mqc_nmps[*cxstate];
+-    } else {
+-        if (lps)
+-            mqc->a = ff_mqc_qe[*cxstate];
+-        d = 1 - (*cxstate & 1);
+-        *cxstate = ff_mqc_nlps[*cxstate];
+-    }
+-    // do RENORMD: see ISO/IEC 15444-1:2002 §C.3.3
+-    do {
+-        if (!(mqc->c & 0xff)) {
+-            mqc->c -= 0x100;
+-            bytein(mqc);
+-        }
+-        mqc->a += mqc->a;
+-        mqc->c += mqc->c;
+-    } while (!(mqc->a & 0x8000));
+-    return d;
+-}
+-
+ void ff_mqc_initdec(MqcState *mqc, uint8_t *bp, int raw, int reset)
+ {
+     mqc->raw = raw;
+     if (reset)
+         ff_mqc_init_contexts(mqc);
+     mqc->bp = bp;
+-    mqc->c  = (*mqc->bp ^ 0xff) << 16;
+-    bytein(mqc);
+-    mqc->c = mqc->c << 7;
+-    mqc->a = 0x8000;
+-}
+-
+-static int mqc_decode_bypass(MqcState *mqc) {
+-    int bit = !(mqc->c & 0x40000000);
+-    if (!(mqc->c & 0xff)) {
+-        mqc->c -= 0x100;
+-        bytein(mqc);
++    if (raw) {
++        mqc->c  = (*mqc->bp ^ 0xff) << 16;
++        ff_mqc_bytein32_inline(mqc);
++        mqc->c = mqc->c << 7;
++    } else {
++        mqc->c64 = (uint64_t)(*mqc->bp ^ 0xff) << 48;
++        mqc->shift_count = 0;
++        ff_mqc_bytein_inline(mqc);
++        mqc->c64 <<= 7;
++        mqc->shift_count -= 7;
+     }
+-    mqc->c += mqc->c;
+-    return bit;
++    mqc->a = 0x8000;
+ }
+ 
+ int ff_mqc_decode(MqcState *mqc, uint8_t *cxstate)
+ {
+-    if (mqc->raw)
+-        return mqc_decode_bypass(mqc);
+-    mqc->a -= ff_mqc_qe[*cxstate];
+-    if ((mqc->c >> 16) < mqc->a) {
+-        if (mqc->a & 0x8000)
+-            return *cxstate & 1;
+-        else
+-            return exchange(mqc, cxstate, 0);
+-    } else {
+-        mqc->c -= mqc->a << 16;
+-        return exchange(mqc, cxstate, 1);
+-    }
++    return ff_mqc_decode_inline(mqc, cxstate);
+ }

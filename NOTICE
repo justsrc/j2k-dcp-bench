@@ -1,0 +1,29 @@
+This repository contains patches and build definitions for third-party
+projects. Those projects keep their own copyright and license terms.
+
+FFmpeg
+  https://ffmpeg.org/
+  The patched files are part of FFmpeg and are licensed under the GNU Lesser
+  General Public License, version 2.1 or later. The build enables GPL
+  components, so the resulting application is GPL version 3 or later.
+
+mpv
+  https://mpv.io/
+  GPL version 2 or later.
+
+j2k
+  https://github.com/frames-sg/j2k
+  Dual-licensed MIT or Apache-2.0. The patches in patches/j2k add a static
+  library target and expose the Metal backend through the C ABI.
+
+libass
+  https://github.com/libass/libass
+  ISC license.
+
+libplacebo
+  https://github.com/haasn/libplacebo
+  GNU Lesser General Public License, version 2.1 or later.
+
+The application artifact bundles libraries installed by Homebrew on the build
+runner. Their licenses are included in the bundle and the FFmpeg license
+strings are copied to dist/ffmpeg_license.txt.

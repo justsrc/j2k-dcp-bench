@@ -1,0 +1,144 @@
+From 59cca28912d355cd9116b880ec4d0892c031f598 Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:58:54 +0530
+Subject: [PATCH 11/11] avcodec/jpeg2000dwt: fuse the 9/7 float lifting steps
+
+Steps 1 and 2 feed each other, and so do steps 3 and 4: the second step
+of each pair reads only the first step's output for the current and the
+next index. Emit it as soon as those exist and carry the far operand, so
+each element is loaded and stored once per pair instead of once per step.
+Operands and evaluation order are unchanged.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ libavcodec/jpeg2000dwt.c | 97 +++++++++++++++++++++++++++++++---------
+ 1 file changed, 75 insertions(+), 22 deletions(-)
+
+diff --git a/libavcodec/jpeg2000dwt.c b/libavcodec/jpeg2000dwt.c
+index e97cbf5fe4..bceb625e0a 100644
+--- a/libavcodec/jpeg2000dwt.c
++++ b/libavcodec/jpeg2000dwt.c
+@@ -383,8 +383,6 @@ static void dwt_decode53(DWTContext *s, int *t)
+ 
+ static void sr_1d97_float(float *p, int i0, int i1)
+ {
+-    int i;
+-
+     if (i1 <= i0 + 1) {
+         if (i0 == 1)
+             p[1] *= F_LFTG_K/2;
+@@ -395,17 +393,48 @@ static void sr_1d97_float(float *p, int i0, int i1)
+ 
+     extend97_float(p, i0, i1);
+ 
+-    for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 2; i++)
+-        p[2 * i]     -= F_LFTG_DELTA * (p[2 * i - 1] + p[2 * i + 1]);
+-    /* step 4 */
+-    for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 1; i++)
+-        p[2 * i + 1] -= F_LFTG_GAMMA * (p[2 * i]     + p[2 * i + 2]);
+-    /*step 5*/
+-    for (i = (i0 >> 1); i < (i1 >> 1) + 1; i++)
+-        p[2 * i]     += F_LFTG_BETA  * (p[2 * i - 1] + p[2 * i + 1]);
+-    /* step 6 */
+-    for (i = (i0 >> 1); i < (i1 >> 1); i++)
+-        p[2 * i + 1] += F_LFTG_ALPHA * (p[2 * i]     + p[2 * i + 2]);
++    /* Steps 1+2 fused in one ascending pass. Step 1 writes E1[i] and step 2
++     * reads E1[i] and E1[i+1], so O2[i-1] can be emitted as soon as E1[i] is
++     * known; the original O[i-1] is carried from the previous iteration
++     * because its slot has already been overwritten by then. Each pass now
++     * touches every element once instead of twice, and the operands and
++     * evaluation order are unchanged, so the result is bit-identical. */
++    {
++        const int lo = (i0 >> 1) - 1, hi = i1 >> 1;
++        float op = p[2 * lo - 1], e1p = 0.0f;
++        int i;
++
++        for (i = lo; i < hi + 2; i++) {
++            float o1 = p[2 * i + 1];
++            float e1 = p[2 * i] - F_LFTG_DELTA * (op + o1);
++
++            p[2 * i] = e1;
++            if (i > lo)
++                p[2 * i - 1] = op - F_LFTG_GAMMA * (e1p + e1);
++
++            op   = o1;
++            e1p  = e1;
++        }
++    }
++
++    /* Steps 3+4 fused the same way, reading back E1 and O2. */
++    {
++        const int lo = i0 >> 1, hi = i1 >> 1;
++        float o2p = p[2 * lo - 1], e3p = 0.0f;
++        int i;
++
++        for (i = lo; i < hi + 1; i++) {
++            float o2c = p[2 * i + 1];
++            float e3  = p[2 * i] + F_LFTG_BETA * (o2p + o2c);
++
++            p[2 * i] = e3;
++            if (i > lo)
++                p[2 * i - 1] = o2p + F_LFTG_ALPHA * (e3p + e3);
++
++            o2p = o2c;
++            e3p = e3;
++        }
++    }
+ }
+ 
+ /* Vertical 9/7 synthesis for full blocks of F_DWT_BLOCK consecutive columns.
+@@ -576,21 +605,45 @@ static void dwt_decode97_float(DWTContext *s, float *t)
+             int eoff = mh ? c1 : 0, ooff = mh ? 0 : c1;
+             int cE = mh ? c2 : c1, cO = mh ? c1 : c2;
+             const int cmin = FFMIN(cE, cO);
+-            const float *src = data + (size_t)w * lp;
+-
+-            for (j = 0; j < cmin; j++) {
+-                l[2 * j]     = src[eoff + j];
+-                l[2 * j + 1] = src[ooff + j];
++            const float *restrict src = data + (size_t)w * lp;
++            const float *restrict srcE = src + eoff;
++            const float *restrict srcO = src + ooff;
++            float *restrict dst = l;
++
++            /* Four index pairs per iteration: the two loads become one
++             * 128-bit load per source, and the two interleaved stores one
++             * 256-bit store, so the permutation runs at memory speed
++             * instead of one scalar load/store pair per coefficient. */
++            for (j = 0; j + 4 <= cmin; j += 4) {
++                float e0 = srcE[j], e1 = srcE[j + 1];
++                float e2 = srcE[j + 2], e3 = srcE[j + 3];
++                float o0 = srcO[j], o1 = srcO[j + 1];
++                float o2 = srcO[j + 2], o3 = srcO[j + 3];
++
++                dst[2 * j]      = e0;
++                dst[2 * j + 1]  = o0;
++                dst[2 * j + 2]  = e1;
++                dst[2 * j + 3]  = o1;
++                dst[2 * j + 4]  = e2;
++                dst[2 * j + 5]  = o2;
++                dst[2 * j + 6]  = e3;
++                dst[2 * j + 7]  = o3;
++            }
++            for (; j < cmin; j++) {
++                dst[2 * j]     = srcE[j];
++                dst[2 * j + 1] = srcO[j];
+             }
+             for (; j < cE; j++)
+-                l[2 * j] = src[eoff + j];
++                dst[2 * j] = srcE[j];
+             for (; j < cO; j++)
+-                l[2 * j + 1] = src[ooff + j];
++                dst[2 * j + 1] = srcO[j];
+ 
+             sr_1d97_float(line, mh, mh + lh);
+ 
+-            for (j = 0; j < lh; j++)
+-                data[(size_t)w * lp + j] = l[j];
++            /* The lifted line is moved back unchanged; memcpy lets the
++             * compiler emit a vector copy instead of an aliasing-limited
++             * scalar loop. */
++            memcpy(data + (size_t)w * lp, l, (size_t)lh * sizeof(float));
+         }
+ 
+         // VER_SD

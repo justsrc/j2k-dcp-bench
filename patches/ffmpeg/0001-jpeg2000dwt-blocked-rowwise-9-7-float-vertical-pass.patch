@@ -1,0 +1,223 @@
+From c4a554ae9d28d9f69ca284d807681e0055c290c8 Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:40:05 +0530
+Subject: [PATCH 01/11] avcodec/jpeg2000dwt: process the 9/7 float vertical
+ pass in row-wise blocks
+
+The 9/7 float inverse DWT vertical pass works one column at a time,
+which prevents vectorization and repeats memory traffic for every
+lifting step. Process 16-column blocks through transposed scratch
+allocated once at init.
+
+Tails and short vertical passes keep the existing path.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ libavcodec/jpeg2000dwt.c | 148 +++++++++++++++++++++++++++++++++++----
+ libavcodec/jpeg2000dwt.h |   1 +
+ 2 files changed, 136 insertions(+), 13 deletions(-)
+
+diff --git a/libavcodec/jpeg2000dwt.c b/libavcodec/jpeg2000dwt.c
+index 9ee8122658..c78ce45885 100644
+--- a/libavcodec/jpeg2000dwt.c
++++ b/libavcodec/jpeg2000dwt.c
+@@ -25,6 +25,8 @@
+  * Discrete wavelet transform
+  */
+ 
++#include <string.h>
++
+ #include "libavutil/error.h"
+ #include "libavutil/macros.h"
+ #include "libavutil/mem.h"
+@@ -37,6 +39,12 @@
+ #define F_LFTG_GAMMA  0.882911075530934f
+ #define F_LFTG_DELTA  0.443506852043971f
+ 
++/* Block width of the transposed scratch used by the 9/7 float vertical
++ * synthesis: 16 floats per row is one full cache line and exactly four
++ * 128-bit vectors, so every lifting step runs as row-wise SIMD across the
++ * block while each column keeps the scalar evaluation order (bit-exact). */
++#define F_DWT_BLOCK 16
++
+ /* Lifting parameters in integer format.
+  * Computed as param = (float param) * (1 << 16) */
+ #define I_LFTG_ALPHA_PRIME   38413ll // = 103949 - 65536, (= alpha - 1.0)
+@@ -400,6 +408,97 @@ static void sr_1d97_float(float *p, int i0, int i1)
+         p[2 * i + 1] += F_LFTG_ALPHA * (p[2 * i]     + p[2 * i + 2]);
+ }
+ 
++/* Vertical 9/7 synthesis for full blocks of F_DWT_BLOCK consecutive columns,
++ * using the transposed scratch rows in s->f_blockbuf. Scratch row index r
++ * holds signal row y = i0 - 4 + r (i0 = mv), covering every row the lifting
++ * reads or writes ([i0-4, i1+3]). The value placement, arithmetic, evaluation
++ * order and boundary mirroring replicate the scalar gather + extend97_float +
++ * sr_1d97_float + scatter sequence exactly, so the output is bit-identical to
++ * the per-column pass; only the memory access changes from per-column
++ * gathers/scatters to row-wise operations over the block, which the compiler
++ * vectorizes.
++ * Returns the number of columns processed (multiple of F_DWT_BLOCK). */
++static int dwt_decode97_float_ver_block(DWTContext *s, float *data, int w,
++                                        int lv, int mv, int lh)
++{
++    const int i0 = mv, i1 = mv + lv;
++    /* rows[y] maps scratch row r = y - (i0 - 4) for y in [i0-4, i1+3] */
++    float *rows = s->f_blockbuf + (ptrdiff_t)(4 - i0) * F_DWT_BLOCK;
++    /* scalar gather interleaving: data rows 0..E-1 land on signal rows
++     * i0, i0+2, ... (low subband), the rest on i0+1, i0+3, ... (high). */
++    const int E = (lv - mv + 1) >> 1;
++    int lp0, y, j, i, k;
++
++    if (!s->f_blockbuf)
++        return 0;
++
++    for (lp0 = 0; lp0 + F_DWT_BLOCK <= lh; lp0 += F_DWT_BLOCK) {
++        /* gather the block's rows, replicating the scalar interleave exactly:
++         * with l = line + mv, loop 1 places data rows 0..E-1 at line indices
++         * 2mv+2j (even = low subband), loop 2 places the rest at 1+2(j-E)
++         * (odd = high subband) — both independent of the parity of mv. */
++        for (j = 0; j < E; j++)
++            memcpy(rows + (ptrdiff_t)(2 * mv + 2 * j) * F_DWT_BLOCK,
++                   data + (size_t)j * w + lp0,
++                   F_DWT_BLOCK * sizeof(float));
++        for (; j < lv; j++)
++            memcpy(rows + (ptrdiff_t)(1 + 2 * (j - E)) * F_DWT_BLOCK,
++                   data + (size_t)j * w + lp0,
++                   F_DWT_BLOCK * sizeof(float));
++
++        /* boundary mirroring, identical to extend97_float */
++        for (i = 1; i <= 4; i++) {
++            memcpy(rows + (ptrdiff_t)(i0 - i) * F_DWT_BLOCK,
++                   rows + (ptrdiff_t)(i0 + i) * F_DWT_BLOCK,
++                   F_DWT_BLOCK * sizeof(float));
++            memcpy(rows + (ptrdiff_t)(i1 + i - 1) * F_DWT_BLOCK,
++                   rows + (ptrdiff_t)(i1 - i - 1) * F_DWT_BLOCK,
++                   F_DWT_BLOCK * sizeof(float));
++        }
++
++        /* step 1, loop range identical to sr_1d97_float */
++        for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 2; i++) {
++            float *ry  = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
++            float *ry1 = rows + (ptrdiff_t)(2 * i - 1) * F_DWT_BLOCK;
++            float *ry2 = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
++            for (k = 0; k < F_DWT_BLOCK; k++)
++                ry[k] -= F_LFTG_DELTA * (ry1[k] + ry2[k]);
++        }
++        /* step 2 */
++        for (i = (i0 >> 1) - 1; i < (i1 >> 1) + 1; i++) {
++            float *ry  = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
++            float *ry1 = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
++            float *ry2 = rows + (ptrdiff_t)(2 * i + 2) * F_DWT_BLOCK;
++            for (k = 0; k < F_DWT_BLOCK; k++)
++                ry[k] -= F_LFTG_GAMMA * (ry1[k] + ry2[k]);
++        }
++        /* step 3 */
++        for (i = (i0 >> 1); i < (i1 >> 1) + 1; i++) {
++            float *ry  = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
++            float *ry1 = rows + (ptrdiff_t)(2 * i - 1) * F_DWT_BLOCK;
++            float *ry2 = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
++            for (k = 0; k < F_DWT_BLOCK; k++)
++                ry[k] += F_LFTG_BETA * (ry1[k] + ry2[k]);
++        }
++        /* step 4 */
++        for (i = (i0 >> 1); i < (i1 >> 1); i++) {
++            float *ry  = rows + (ptrdiff_t)(2 * i + 1) * F_DWT_BLOCK;
++            float *ry1 = rows + (ptrdiff_t)(2 * i) * F_DWT_BLOCK;
++            float *ry2 = rows + (ptrdiff_t)(2 * i + 2) * F_DWT_BLOCK;
++            for (k = 0; k < F_DWT_BLOCK; k++)
++                ry[k] += F_LFTG_ALPHA * (ry1[k] + ry2[k]);
++        }
++
++        /* scatter: with l = line + mv, the scalar pass writes data row i from
++         * line index mv+i, i in [0, lv) — i.e. signal rows [mv, mv+lv) */
++        for (y = 0; y < lv; y++)
++            memcpy(data + (size_t)y * w + lp0,
++                   rows + (ptrdiff_t)(mv + y) * F_DWT_BLOCK,
++                   F_DWT_BLOCK * sizeof(float));
++    }
++    return lp0;
++}
++
+ static void dwt_decode97_float(DWTContext *s, float *t)
+ {
+     int lev;
+@@ -433,19 +532,29 @@ static void dwt_decode97_float(DWTContext *s, float *t)
+         }
+ 
+         // VER_SD
+-        l = line + mv;
+-        for (lp = 0; lp < lh; lp++) {
+-            int i, j = 0;
+-            // copy with interleaving
+-            for (i = mv; i < lv; i += 2, j++)
+-                l[i] = data[w * j + lp];
+-            for (i = 1 - mv; i < lv; i += 2, j++)
+-                l[i] = data[w * j + lp];
+-
+-            sr_1d97_float(line, mv, mv + lv);
+-
+-            for (i = 0; i < lv; i++)
+-                data[w * i + lp] = l[i];
++        {
++            /* Full blocks of columns go through the transposed scratch:
++             * rows of F_DWT_BLOCK consecutive columns, lifted row-wise.
++             * Arithmetic per column is identical to the scalar path below
++             * (same lifting order, same boundary mirroring), so output is
++             * bit-exact; the remainder keeps the per-column gather. */
++            int lpt = 0;
++            if (s->f_blockbuf && lv >= 8)
++                lpt = dwt_decode97_float_ver_block(s, data, w, lv, mv, lh);
++            l = line + mv;
++            for (lp = lpt; lp < lh; lp++) {
++                int i, j = 0;
++                // copy with interleaving
++                for (i = mv; i < lv; i += 2, j++)
++                    l[i] = data[w * j + lp];
++                for (i = 1 - mv; i < lv; i += 2, j++)
++                    l[i] = data[w * j + lp];
++
++                sr_1d97_float(line, mv, mv + lv);
++
++                for (i = 0; i < lv; i++)
++                    data[w * i + lp] = l[i];
++            }
+         }
+     }
+ }
+@@ -563,6 +672,18 @@ int ff_jpeg2000_dwt_init(DWTContext *s, int border[2][2],
+         s->f_linebuf = av_malloc_array((maxlen + 12), sizeof(*s->f_linebuf));
+         if (!s->f_linebuf)
+             return AVERROR(ENOMEM);
++        if (decomp_levels > 0) {
++            /* transposed scratch for the row-wise (block) vertical pass:
++             * rows cover signal indices [i0-4, i1+3]; the widest vertical
++             * extent is the finest level, linelen[ndeclevels-1][1] */
++            s->f_blockbuf = av_malloc_array(
++                (size_t)(s->linelen[decomp_levels - 1][1] + 8) * F_DWT_BLOCK,
++                sizeof(float));
++            if (!s->f_blockbuf) {
++                av_freep(&s->f_linebuf);
++                return AVERROR(ENOMEM);
++            }
++        }
+         break;
+      case FF_DWT97_INT:
+         s->i_linebuf = av_malloc_array((maxlen + 12), sizeof(*s->i_linebuf));
+@@ -623,4 +744,5 @@ void ff_dwt_destroy(DWTContext *s)
+ {
+     av_freep(&s->f_linebuf);
+     av_freep(&s->i_linebuf);
++    av_freep(&s->f_blockbuf);
+ }
+diff --git a/libavcodec/jpeg2000dwt.h b/libavcodec/jpeg2000dwt.h
+index 62f0548ac8..6ddf8b7046 100644
+--- a/libavcodec/jpeg2000dwt.h
++++ b/libavcodec/jpeg2000dwt.h
+@@ -49,6 +49,7 @@ typedef struct DWTContext {
+     uint8_t type;                        ///< 0 for 9/7; 1 for 5/3
+     int32_t *i_linebuf;                  ///< int buffer used by transform
+     float   *f_linebuf;                  ///< float buffer used by transform
++    float   *f_blockbuf;                 ///< transposed block scratch
+ } DWTContext;
+ 
+ /**

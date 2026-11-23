@@ -1,0 +1,60 @@
+diff --git a/configure b/configure
+index 227c2d2..68a4e46 100755
+--- a/configure
++++ b/configure
+@@ -227,6 +227,7 @@ External library support:
+   --enable-libcdio         enable audio CD grabbing with libcdio [no]
+   --enable-libcodec2       enable codec2 en/decoding using libcodec2 [no]
+   --enable-libdav1d        enable AV1 decoding via libdav1d [no]
++  --enable-libj2k          enable JPEG 2000 / HTJ2K decoding via libj2k [no]
+   --enable-libdavs2        enable AVS2 decoding via libdavs2 [no]
+   --enable-libdc1394       enable IIDC-1394 grabbing using libdc1394
+                            and libraw1394 [no]
+@@ -2074,6 +2075,7 @@ EXTERNAL_LIBRARY_LIST="
+     libiec61883
+     libilbc
+     libjack
++    libj2k
+     libjxl
+     libklvanc
+     libkvazaar
+@@ -3806,6 +3808,7 @@ libastcenc_decoder_deps="libastcenc"
+ libcodec2_decoder_deps="libcodec2"
+ libcodec2_encoder_deps="libcodec2"
+ libdav1d_decoder_deps="libdav1d"
++libj2k_decoder_deps="libj2k"
+ libdav1d_decoder_select="itut_t35"
+ libdavs2_decoder_deps="libdavs2"
+ libdavs2_decoder_select="avs2_parser"
+@@ -7292,6 +7295,7 @@ enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_
+ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+ enabled libcurl           && check_pkg_config libcurl "libcurl >= 7.88.0" curl/curl.h curl_easy_init
+ enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 1.0.0" "dav1d/dav1d.h" dav1d_version
++enabled libj2k            && require libj2k j2k.h j2k_abi_version -lj2k_c -liconv
+ enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+ enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
+ enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index f12ad9c..e4648c1 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1193,6 +1193,7 @@ OBJS-$(CONFIG_LIBASTCENC_DECODER)         += libastcdec.o
+ OBJS-$(CONFIG_LIBCODEC2_DECODER)          += libcodec2.o
+ OBJS-$(CONFIG_LIBCODEC2_ENCODER)          += libcodec2.o
+ OBJS-$(CONFIG_LIBDAV1D_DECODER)           += libdav1d.o av1_parse.o
++OBJS-$(CONFIG_LIBJ2K_DECODER)             += libj2kdec.o
+ OBJS-$(CONFIG_LIBDAVS2_DECODER)           += libdavs2.o
+ OBJS-$(CONFIG_LIBFDK_AAC_DECODER)         += libfdk-aacdec.o
+ OBJS-$(CONFIG_LIBFDK_AAC_ENCODER)         += libfdk-aacenc.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index edbe44e..b90a6e0 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -784,6 +784,7 @@ extern const FFCodec ff_libastcenc_decoder;
+ extern const FFCodec ff_libcodec2_encoder;
+ extern const FFCodec ff_libcodec2_decoder;
+ extern const FFCodec ff_libdav1d_decoder;
++extern const FFCodec ff_libj2k_decoder;
+ extern const FFCodec ff_libdavs2_decoder;
+ extern const FFCodec ff_libfdk_aac_encoder;
+ extern const FFCodec ff_libfdk_aac_decoder;

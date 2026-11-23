@@ -1,0 +1,150 @@
+From a3cef512fac2868a6f478029720c4efe6c120a5e Mon Sep 17 00:00:00 2001
+From: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:58:54 +0530
+Subject: [PATCH 10/11] avcodec/jpeg2000dec: skip reconstruction and output
+ work that changes nothing
+
+Without an ROI shift the sample rewrite stores every coefficient back
+unchanged, so return before it.
+
+For a packed format whose three components share one geometry, write the
+components in a single interleaved pass instead of three strided ones.
+
+Signed-off-by: Justin Jacob <159104807+Justin24506@users.noreply.github.com>
+---
+ libavcodec/jpeg2000dec.c | 107 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 93 insertions(+), 14 deletions(-)
+
+diff --git a/libavcodec/jpeg2000dec.c b/libavcodec/jpeg2000dec.c
+index 5037512a7a..784d6709e2 100644
+--- a/libavcodec/jpeg2000dec.c
++++ b/libavcodec/jpeg2000dec.c
+@@ -2364,20 +2364,28 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
+         av_log(s->avctx, AV_LOG_WARNING, "Synthetic End of Stream Marker Read.\n");
+     }
+ 
++    /* Without ROI the pass below rewrites every coefficient with its own
++     * value; the samples are already in the form the DWT expects. */
++    if (!roi_shift)
++        return 1;
++
+     /* Reconstruct the sample values */
+-    for (int y = 0; y < height; y++) {
+-        for (int x = 0; x < width; x++) {
+-            int32_t sign, n, val;
+-            const uint32_t mask  = (int64_t)UINT32_MAX >> (M_b + 1); // bit mask for ROI detection
+-
+-            n = x + (y * t1->stride);
+-            val = t1->data[n];
+-            sign = val & INT32_MIN;
+-            val &= INT32_MAX;
+-            /* ROI shift, if necessary */
+-            if (roi_shift && (((uint32_t)val & ~mask) == 0))
+-                val = (uint32_t)val << roi_shift;
+-            t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
++    {
++        const uint32_t mask = (int64_t)UINT32_MAX >> (M_b + 1); // bit mask for ROI detection
++
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                int32_t sign, n, val;
++
++                n = x + (y * t1->stride);
++                val = t1->data[n];
++                sign = val & INT32_MIN;
++                val &= INT32_MAX;
++                /* ROI shift, if necessary */
++                if (roi_shift && (((uint32_t)val & ~mask) == 0))
++                    val = (uint32_t)val << roi_shift;
++                t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
++            }
+         }
+     }
+     return 1;
+@@ -2663,6 +2671,74 @@ WRITE_FRAME(16, uint16_t)
+ 
+ #undef WRITE_FRAME
+ 
++/* Output for a packed format whose three components share one geometry: a
++ * single interleaved pass over the frame instead of three strided ones. */
++static void write_frame_16_packed(const Jpeg2000DecoderContext *s,
++                                  Jpeg2000Tile *tile, AVFrame *picture,
++                                  int precision)
++{
++    Jpeg2000Component *comp = tile->comp;
++    const int cbps  = s->cbps[0];
++    const int shift = precision - cbps;
++    const int off   = 1 << (cbps - 1);
++    const int max   = (1 << cbps) - 1;
++    const int w = comp[0].coord[0][1] -
++                  ff_jpeg2000_ceildiv(s->image_offset_x, s->cdx[0]);
++    const int h = comp[0].coord[1][1] -
++                  ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[0]);
++    /* Component placement of the per-component path. */
++    const int p0 = s->cdef[0] ? s->cdef[0] - 1 : 0;
++    const int p1 = s->cdef[1] ? s->cdef[1] - 1 : 1;
++    const int p2 = s->cdef[2] ? s->cdef[2] - 1 : 2;
++    int x, y;
++
++    for (y = 0; y < h; y++) {
++        const float *d0 = comp[0].f_data + (ptrdiff_t)y * w;
++        const float *d1 = comp[1].f_data + (ptrdiff_t)y * w;
++        const float *d2 = comp[2].f_data + (ptrdiff_t)y * w;
++        uint16_t *dst = (uint16_t *)picture->data[0] +
++                        (ptrdiff_t)y * (picture->linesize[0] / 2);
++
++        for (x = 0; x < w; x++) {
++            dst[p0] = av_clip(lrintf(d0[x]) + off, 0, max) << shift;
++            dst[p1] = av_clip(lrintf(d1[x]) + off, 0, max) << shift;
++            dst[p2] = av_clip(lrintf(d2[x]) + off, 0, max) << shift;
++            dst += 3;
++        }
++    }
++}
++
++static int can_write_packed(const Jpeg2000DecoderContext *s,
++                            const Jpeg2000Tile *tile)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(s->avctx->pix_fmt);
++    const Jpeg2000Component *c0 = tile->comp;
++    int compno;
++
++    if (s->ncomponents != 3 || s->precision <= 8 || !desc)
++        return 0;
++    if ((desc->flags & AV_PIX_FMT_FLAG_PLANAR) || desc->nb_components != 3)
++        return 0;
++    if (c0->coord[0][0] != ff_jpeg2000_ceildiv(s->image_offset_x, s->cdx[0]) ||
++        c0->coord[1][0] != ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[0]))
++        return 0;
++    for (compno = 0; compno < 3; compno++) {
++        const Jpeg2000Component *c = tile->comp + compno;
++        const Jpeg2000CodingStyle *cs = tile->codsty + compno;
++
++        if (cs->transform != FF_DWT97 || s->cbps[compno] != s->cbps[0])
++            return 0;
++        if (c->coord[0][0] != c0->coord[0][0] ||
++            c->coord[0][1] != c0->coord[0][1] ||
++            c->coord[1][0] != c0->coord[1][0] ||
++            c->coord[1][1] != c0->coord[1][1])
++            return 0;
++        if (s->cdx[compno] != s->cdx[0] || s->cdy[compno] != s->cdy[0])
++            return 0;
++    }
++    return 1;
++}
++
+ static int jpeg2000_decode_tile(AVCodecContext *avctx, void *td,
+                                 int jobnr, int threadnr)
+ {
+@@ -2686,7 +2762,10 @@ static int jpeg2000_decode_tile(AVCodecContext *avctx, void *td,
+                         picture->format == AV_PIX_FMT_RGBA64 ||
+                         picture->format == AV_PIX_FMT_GRAY16 ? 16 : s->precision;
+ 
+-        write_frame_16(s, tile, picture, precision);
++        if (can_write_packed(s, tile))
++            write_frame_16_packed(s, tile, picture, precision);
++        else
++            write_frame_16(s, tile, picture, precision);
+     }
+ 
+     return 0;

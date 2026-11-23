@@ -1,0 +1,207 @@
+diff --git a/crates/j2k-c/src/decoder.rs b/crates/j2k-c/src/decoder.rs
+index a337900..45bfa5d 100644
+--- a/crates/j2k-c/src/decoder.rs
++++ b/crates/j2k-c/src/decoder.rs
+@@ -4,29 +4,33 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++#[cfg(feature = "metal")]
++use crate::abi::J2K_DECODE_FAILED;
+ use crate::{
+     abi::{
+         J2kCColorInfo, J2kCComponentInfo, J2kCDecodeOptions, J2kCImageInfo, J2kCOpenOptions,
+         J2kCOutputInfo, J2K_ALLOCATION_FAILED, J2K_ALPHA_NONE, J2K_ALPHA_PREMULTIPLIED,
+         J2K_ALPHA_STRAIGHT, J2K_BUFFER_TOO_SMALL, J2K_COLOR_ENUMERATED, J2K_COLOR_ICC,
+-        J2K_COLOR_NONE, J2K_COLOR_UNKNOWN, J2K_DECODE_FAILED, J2K_I16_LE, J2K_INVALID_INPUT,
+-        J2K_OPEN_FLAGS, J2K_OPEN_LENIENT, J2K_SYNTAX_HT_JPEG2000_LOSSLESS,
+-        J2K_SYNTAX_HT_JPEG2000_LOSSY, J2K_SYNTAX_JPEG2000_LOSSLESS, J2K_SYNTAX_JPEG2000_LOSSY,
+-        J2K_SYNTAX_JPEG_BASELINE8, J2K_SYNTAX_JPEG_EXTENDED, J2K_SYNTAX_JPEG_LOSSLESS,
+-        J2K_SYNTAX_JPEG_LOSSLESS_SV1, J2K_SYNTAX_JPEG_PROGRESSIVE, J2K_SYNTAX_OTHER, J2K_U16_LE,
+-        J2K_U8, J2K_UNSUPPORTED, J2K_WARNING_LENIENT_RECOVERY,
++        J2K_COLOR_NONE, J2K_COLOR_UNKNOWN, J2K_I16_LE, J2K_INVALID_INPUT, J2K_OPEN_FLAGS,
++        J2K_OPEN_LENIENT, J2K_SYNTAX_HT_JPEG2000_LOSSLESS, J2K_SYNTAX_HT_JPEG2000_LOSSY,
++        J2K_SYNTAX_JPEG2000_LOSSLESS, J2K_SYNTAX_JPEG2000_LOSSY, J2K_SYNTAX_JPEG_BASELINE8,
++        J2K_SYNTAX_JPEG_EXTENDED, J2K_SYNTAX_JPEG_LOSSLESS, J2K_SYNTAX_JPEG_LOSSLESS_SV1,
++        J2K_SYNTAX_JPEG_PROGRESSIVE, J2K_SYNTAX_OTHER, J2K_U16_LE, J2K_U8, J2K_UNSUPPORTED,
++        J2K_WARNING_LENIENT_RECOVERY,
+     },
+     error::{Error, Result},
+ };
++#[cfg(feature = "metal")]
++use j2k::BackendRequest;
+ use j2k::{
+-    BackendRequest, BatchAlpha, BatchDecodeOptions, BatchLayout, CompressedTransferSyntax,
+-    CpuBatchDecoder, CpuBatchSamples, DecodeRequest, DecodeSettings, Downscale, EncodedImage,
+-    J2kColorSpec, J2kDecodeControl, J2kDecodeWarning, J2kDecoder, J2kReferenceGrid, J2kSupportInfo,
++    BatchAlpha, BatchDecodeOptions, BatchLayout, CompressedTransferSyntax, CpuBatchDecoder,
++    CpuBatchSamples, DecodeRequest, DecodeSettings, Downscale, EncodedImage, J2kColorSpec,
++    J2kDecodeControl, J2kDecodeWarning, J2kDecoder, J2kReferenceGrid, J2kSupportInfo,
+     NativeSampleType, PixelFormat, PreparedBatch, Rect,
+ };
+-use std::{num::NonZeroUsize, sync::Arc};
+ #[cfg(feature = "metal")]
+ use j2k_metal::MetalBackendSession;
++use std::{num::NonZeroUsize, sync::Arc};
+ 
+ const DEFAULT_LIMIT: u64 = 512 * 1024 * 1024;
+ /// Most decode threads a decoder's own pool may have.
+@@ -187,7 +191,14 @@ impl Decoder {
+         if options.reserved != 0 {
+             return Err(Error::argument("reserved decode options must be zero"));
+         }
+-        if [options.x, options.y, options.width, options.height, options.reduction] != [0; 5] {
++        if [
++            options.x,
++            options.y,
++            options.width,
++            options.height,
++            options.reduction,
++        ] != [0; 5]
++        {
+             return Err(Error::new(
+                 J2K_UNSUPPORTED,
+                 "the native fast path covers the full image at full resolution",
+@@ -286,7 +297,10 @@ impl Decoder {
+             ));
+         }
+         let fmt = core_pixel_format(&info).ok_or_else(|| {
+-            Error::new(J2K_UNSUPPORTED, "core full decode does not represent this layout")
++            Error::new(
++                J2K_UNSUPPORTED,
++                "core full decode does not represent this layout",
++            )
+         })?;
+         let bytes = Arc::clone(&self.bytes);
+         let settings = self.settings;
+@@ -295,11 +309,7 @@ impl Decoder {
+             decoder.decode_into(output, stride, fmt)
+         })
+         .map_err(|error| Error::codec(&error))?;
+-        if !outcome
+-            .warnings
+-            .iter()
+-            .all(|warning| self.allows(*warning))
+-        {
++        if !outcome.warnings.iter().all(|warning| self.allows(*warning)) {
+             return Err(Error::internal(
+                 "decode reported a warning its settings do not allow",
+             ));
+@@ -538,7 +548,9 @@ impl Decoder {
+         // decoder than on the batch engine, which plans for streams of images.
+         // Route representable full-image requests there; everything else keeps
+         // the batch route. Both routes deliver the same interleaved samples.
+-        if matches!(request, DecodeRequest::Full) {
++        // The core whole-image decoder cannot represent signed codestreams, so
++        // those requests keep the batch route (and its upstream behavior).
++        if matches!(request, DecodeRequest::Full) && !self.support.has_signed_components() {
+             if let Some(fmt) = core_pixel_format(info) {
+                 let bytes = Arc::clone(&self.bytes);
+                 let settings = self.settings;
+@@ -547,11 +559,7 @@ impl Decoder {
+                     decoder.decode_into(output, stride, fmt)
+                 })
+                 .map_err(|error| Error::codec(&error))?;
+-                if !outcome
+-                    .warnings
+-                    .iter()
+-                    .all(|warning| self.allows(*warning))
+-                {
++                if !outcome.warnings.iter().all(|warning| self.allows(*warning)) {
+                     return Err(Error::internal(
+                         "decode reported a warning its settings do not allow",
+                     ));
+@@ -635,7 +643,10 @@ impl Decoder {
+             ));
+         }
+         let fmt = core_pixel_format(&info).ok_or_else(|| {
+-            Error::new(J2K_UNSUPPORTED, "Metal decode does not represent this layout")
++            Error::new(
++                J2K_UNSUPPORTED,
++                "Metal decode does not represent this layout",
++            )
+         })?;
+         let bytes = Arc::clone(&self.bytes);
+         let request = j2k_metal::MetalDecodeRequest::full(fmt, BackendRequest::Metal);
+@@ -659,9 +670,7 @@ fn metal_error(error: &j2k_metal::Error) -> Error {
+     let message = error.to_string();
+     let code = match error {
+         j2k_metal::Error::Decode(source) => return Error::codec(source),
+-        j2k_metal::Error::BatchInfrastructure(source) => {
+-            return Error::infrastructure(source.clone())
+-        }
++        j2k_metal::Error::BatchInfrastructure(source) => return Error::infrastructure(*source),
+         j2k_metal::Error::Buffer(_) => J2K_BUFFER_TOO_SMALL,
+         j2k_metal::Error::UnsupportedBackend { .. }
+         | j2k_metal::Error::UnsupportedMetalRequest { .. }
+diff --git a/crates/j2k-c/src/ffi.rs b/crates/j2k-c/src/ffi.rs
+index 466e7b6..b80c334 100644
+--- a/crates/j2k-c/src/ffi.rs
++++ b/crates/j2k-c/src/ffi.rs
+@@ -613,9 +613,7 @@ pub unsafe extern "C" fn j2k_decoder_metal_init(
+     error: *mut J2kCError,
+ ) -> u32 {
+     // SAFETY: Caller guarantees a live, exclusively used decoder handle.
+-    unsafe {
+-        boundary(error, || with_decoder(decoder, |state| state.metal_init()))
+-    }
++    unsafe { boundary(error, || with_decoder(decoder, Decoder::metal_init)) }
+ }
+ 
+ /// Fork addition: decode the full image at full resolution on the Metal GPU
+diff --git a/crates/j2k-c/src/lib.rs b/crates/j2k-c/src/lib.rs
+index ad725ad..d8b1b1f 100644
+--- a/crates/j2k-c/src/lib.rs
++++ b/crates/j2k-c/src/lib.rs
+@@ -26,15 +26,21 @@ pub use abi::{
+     J2K_PARAMS_NO_COLOR_TRANSFORM, J2K_PROGRESSION_CPRL, J2K_PROGRESSION_LRCP,
+     J2K_PROGRESSION_PCRL, J2K_PROGRESSION_RLCP, J2K_PROGRESSION_RPCL, J2K_RATE_BITS_PER_PIXEL,
+     J2K_RATE_BYTES, J2K_RATE_NONE, J2K_RATE_PSNR_DB, J2K_RESOURCE_LIMIT, J2K_ROUTE_NATIVE_CPU,
+-    J2K_ROUTE_REGION_PLANES, J2K_STOPPED, J2K_U16_LE, J2K_U8, J2K_UNSUPPORTED,
+-    J2K_WARNING_LENIENT_RECOVERY,
++    J2K_ROUTE_REGION_PLANES, J2K_STOPPED, J2K_SYNTAX_HT_JPEG2000_LOSSLESS,
++    J2K_SYNTAX_HT_JPEG2000_LOSSY, J2K_SYNTAX_JPEG2000_LOSSLESS, J2K_SYNTAX_JPEG2000_LOSSY,
++    J2K_SYNTAX_JPEG_BASELINE8, J2K_SYNTAX_JPEG_EXTENDED, J2K_SYNTAX_JPEG_LOSSLESS,
++    J2K_SYNTAX_JPEG_LOSSLESS_SV1, J2K_SYNTAX_JPEG_PROGRESSIVE, J2K_SYNTAX_OTHER, J2K_U16_LE,
++    J2K_U8, J2K_UNSUPPORTED, J2K_WARNING_LENIENT_RECOVERY,
+ };
+ pub use ffi::{
+     j2k_abi_version, j2k_buffer_free, j2k_cancellation_cancel, j2k_cancellation_create,
+     j2k_cancellation_free, j2k_decoder_close, j2k_decoder_color_info, j2k_decoder_component_info,
+-    j2k_decoder_decode_into, j2k_decoder_decode_region_into, j2k_decoder_decode_rows,
+-    j2k_decoder_icc_profile, j2k_decoder_info, j2k_decoder_open, j2k_decoder_output_info,
++    j2k_decoder_decode_full_into, j2k_decoder_decode_into, j2k_decoder_decode_region_into,
++    j2k_decoder_decode_rows, j2k_decoder_feed, j2k_decoder_icc_profile, j2k_decoder_info,
++    j2k_decoder_open, j2k_decoder_output_info, j2k_decoder_output_info_native,
+     j2k_decoder_plan_region, j2k_decoder_prepare_operations, j2k_decoder_row_info,
+-    j2k_decoder_set_operation_cache_limit, j2k_encode, j2k_encode_lossless, j2k_version,
+-    J2kCCancellation, J2kCDecoder, J2kCRowCallback,
++    j2k_decoder_set_operation_cache_limit, j2k_decoder_transfer_syntax, j2k_encode,
++    j2k_encode_lossless, j2k_version, J2kCCancellation, J2kCDecoder, J2kCRowCallback,
+ };
++#[cfg(feature = "metal")]
++pub use ffi::{j2k_decoder_metal_decode_into, j2k_decoder_metal_init};
+diff --git a/crates/j2k-c/tests/rejections.rs b/crates/j2k-c/tests/rejections.rs
+index 05010de..6eb8712 100644
+--- a/crates/j2k-c/tests/rejections.rs
++++ b/crates/j2k-c/tests/rejections.rs
+@@ -579,6 +579,19 @@ fn abi_one_layout_matches_the_c_header_and_accepts_extension_storage() {
+             ("J2K_COLOR_ENUMERATED", J2K_COLOR_ENUMERATED),
+             ("J2K_COLOR_ICC", J2K_COLOR_ICC),
+             ("J2K_COLOR_UNKNOWN", J2K_COLOR_UNKNOWN),
++            ("J2K_SYNTAX_JPEG_BASELINE8", J2K_SYNTAX_JPEG_BASELINE8),
++            ("J2K_SYNTAX_JPEG_EXTENDED", J2K_SYNTAX_JPEG_EXTENDED),
++            ("J2K_SYNTAX_JPEG_PROGRESSIVE", J2K_SYNTAX_JPEG_PROGRESSIVE),
++            ("J2K_SYNTAX_JPEG_LOSSLESS", J2K_SYNTAX_JPEG_LOSSLESS),
++            ("J2K_SYNTAX_JPEG_LOSSLESS_SV1", J2K_SYNTAX_JPEG_LOSSLESS_SV1),
++            ("J2K_SYNTAX_JPEG2000_LOSSLESS", J2K_SYNTAX_JPEG2000_LOSSLESS),
++            ("J2K_SYNTAX_JPEG2000_LOSSY", J2K_SYNTAX_JPEG2000_LOSSY),
++            (
++                "J2K_SYNTAX_HT_JPEG2000_LOSSLESS",
++                J2K_SYNTAX_HT_JPEG2000_LOSSLESS
++            ),
++            ("J2K_SYNTAX_HT_JPEG2000_LOSSY", J2K_SYNTAX_HT_JPEG2000_LOSSY),
++            ("J2K_SYNTAX_OTHER", J2K_SYNTAX_OTHER),
+             ("J2K_U8", J2K_U8),
+             ("J2K_U16_LE", J2K_U16_LE),
+             ("J2K_I16_LE", J2K_I16_LE),

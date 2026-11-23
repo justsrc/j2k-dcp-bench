@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections.abc import Iterator
+from typing import TypedDict, cast
+
+sys_re = re.compile(r"^/System")
+
+
+class _VulkanLibraryEntry(TypedDict):
+    library_path: str
+
+
+_VulkanLoaderJson = dict[str, _VulkanLibraryEntry]
+usr_re = re.compile(r"^/usr/lib/")
+exe_re = re.compile(r"@executable_path")
+
+
+def is_user_lib(objfile: str, libname: str) -> bool:
+    return (
+        not sys_re.match(libname)
+        and not usr_re.match(libname)
+        and not exe_re.match(libname)
+        and "libobjc." not in libname
+        and "libSystem." not in libname
+        and "libc." not in libname
+        and "libgcc." not in libname
+        and os.path.basename(libname) != "Python"
+        and os.path.basename(libname) != os.path.basename(objfile)
+        and "libswift" not in libname
+    )
+
+
+def otool(objfile: str, rpaths: list[str]) -> tuple[set[str], set[str]]:
+    output: str = subprocess.check_output(
+        ["otool", "-L", objfile],
+        universal_newlines=True,
+    )
+    libs: set[str] = set()
+    for line in output.splitlines():
+        if not line.startswith("\t"):
+            continue
+        lib: str = line.split()[0]
+        if is_user_lib(objfile, lib):
+            libs.add(lib)
+
+    libs_resolved: set[str] = set()
+    libs_relative: set[str] = set()
+    for lib in libs:
+        lib_path_resolved: str = resolve_lib_path(objfile, lib, rpaths)
+        libs_resolved.add(lib_path_resolved)
+        if lib_path_resolved != lib:
+            libs_relative.add(lib)
+
+    return libs_resolved, libs_relative
+
+
+def iter_rpaths(objfile: str) -> Iterator[str]:
+    output: str = subprocess.check_output(
+        ["otool", "-l", objfile],
+        universal_newlines=True,
+    )
+    path_re = re.compile(r"^\s*path (.*) \(offset \d*\)$")
+    for line in output.splitlines():
+        if match := path_re.match(line):
+            yield match.group(1).strip()
+
+
+def get_rapths(objfile: str) -> list[str]:
+    loader_path: str = os.path.dirname(objfile)
+    return [
+        # resolve @loader_path
+        os.path.normpath(rpath.replace("@loader_path", loader_path, 1))
+        for rpath in iter_rpaths(objfile)
+    ]
+
+
+# Correct spelling; keep typo alias for backwards compatibility
+def get_rpaths(objfile: str) -> list[str]:
+    return get_rapths(objfile)
+
+
+def get_rpaths_dev_tools(binary: str) -> list[str]:
+    return [
+        rpath
+        for rpath in iter_rpaths(binary)
+        if "Xcode" in rpath or "CommandLineTools" in rpath
+    ]
+
+
+def resolve_lib_path(objfile: str, lib: str, rpaths: list[str]) -> str:
+    if os.path.exists(lib):
+        return lib
+
+    if lib.startswith("@rpath/"):
+        libname: str = lib[len("@rpath/") :]
+        for rpath in rpaths:
+            candidate: str = os.path.join(rpath, libname)
+            if os.path.exists(candidate):
+                return candidate
+
+    elif lib.startswith("@loader_path/"):
+        libname = lib[len("@loader_path/") :]
+        candidate = os.path.normpath(os.path.join(os.path.dirname(objfile), libname))
+        if os.path.exists(candidate):
+            return candidate
+
+    # Homebrew fallback (handles keg-only libraries such as ICU)
+    homebrew_prefix: str = get_homebrew_prefix()
+
+    search_dirs: list[str] = [os.path.join(homebrew_prefix, "lib")]
+
+    opt_dir: str = os.path.join(homebrew_prefix, "opt")
+    if os.path.isdir(opt_dir):
+        search_dirs.extend(
+            os.path.join(opt_dir, formula, "lib")
+            for formula in os.listdir(opt_dir)
+            if os.path.isdir(os.path.join(opt_dir, formula, "lib"))
+        )
+
+    for directory in search_dirs:
+        candidate = os.path.join(directory, os.path.basename(lib))
+        if os.path.exists(candidate):
+            return candidate
+
+    raise Exception("Could not resolve library: " + lib)
+
+
+def check_vulkan_max_version(version: str) -> bool:
+    try:
+        _ = subprocess.check_output(
+            ["pkg-config", "vulkan", f"--max-version={version}"],
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_homebrew_prefix() -> str:
+    # set default to standard ARM path, intel path is already in the vulkan
+    # loader search array
+    result: str = "/opt/homebrew"
+    try:
+        result = subprocess.check_output(
+            ["brew", "--prefix"],
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        pass
+
+    return result
+
+
+def install_name_tool_change(old: str, new: str, objfile: str) -> None:
+    _ = subprocess.call(
+        ["install_name_tool", "-change", old, new, objfile],
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def install_name_tool_id(name: str, objfile: str) -> None:
+    _ = subprocess.call(
+        ["install_name_tool", "-id", name, objfile],
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def install_name_tool_add_rpath(rpath: str, binary: str) -> None:
+    _ = subprocess.call(["install_name_tool", "-add_rpath", rpath, binary])
+
+
+def install_name_tool_delete_rpath(rpath: str, binary: str) -> None:
+    _ = subprocess.call(["install_name_tool", "-delete_rpath", rpath, binary])
+
+
+def is_bundle_rpath(path: str) -> bool:
+    return path.startswith(
+        ("@executable_path", "@loader_path", "/usr/lib", "/System")
+    )
+
+
+def remove_absolute_rpaths(objfile: str) -> None:
+    """Drop LC_RPATHs that point at a build machine or a global prefix.
+
+    Homebrew dylibs often carry an absolute rpath (libjpeg records
+    /opt/homebrew/Cellar/jpeg-turbo/<ver>/lib, for example). Every bundled
+    dependency is rewritten to @executable_path above, so those rpaths are
+    unnecessary; keeping them lets a bundle load a different global copy of
+    a library on the user's machine.
+    """
+    for path in iter_rpaths(objfile):
+        if not is_bundle_rpath(path):
+            print(f">> removing absolute rpath {path} from {objfile}")
+            install_name_tool_delete_rpath(path, objfile)
+
+
+def libraries(
+    objfile: str,
+    result: dict[str, set[str]] | None = None,
+    result_relative: set[str] | None = None,
+    rpaths: list[str] | None = None,
+) -> tuple[dict[str, set[str]], set[str]]:
+    if result is None:
+        result = {}
+
+    if result_relative is None:
+        result_relative = set()
+
+    if rpaths is None:
+        rpaths = []
+
+    rpaths = get_rpaths(objfile) + rpaths
+    libs_list: set[str]
+    libs_relative: set[str]
+    libs_list, libs_relative = otool(objfile, rpaths)
+    result[objfile] = libs_list
+    result_relative |= libs_relative
+
+    for lib in libs_list:
+        if lib not in result:
+            _ = libraries(lib, result, result_relative, rpaths)
+
+    return result, result_relative
+
+
+def lib_path(binary: str) -> str:
+    return os.path.join(os.path.dirname(binary), "lib")
+
+
+def resources_path(binary: str) -> str:
+    return os.path.join(os.path.dirname(binary), "../Resources")
+
+
+def lib_name(lib: str) -> str:
+    return os.path.join("@executable_path", "lib", os.path.basename(lib))
+
+
+def process_libraries(
+    libs_dict: dict[str, set[str]], libs_dyn: set[str], binary: str
+) -> None:
+    libs_set: set[str] = set(libs_dict)
+    # Remove binary from libs_set to prevent a duplicate of the binary being
+    # added to the libs directory.
+    libs_set.remove(binary)
+
+    for src in libs_set:
+        name: str = lib_name(src)
+        dst: str = os.path.join(lib_path(binary), os.path.basename(src))
+
+        _ = shutil.copy(src, dst)
+        os.chmod(dst, 0o755)
+        install_name_tool_id(name, dst)
+
+        if src in libs_dict[binary]:
+            install_name_tool_change(src, name, binary)
+
+        for p in libs_set:
+            if p in libs_dict[src]:
+                install_name_tool_change(p, lib_name(p), dst)
+
+        for lib in libs_dyn:
+            install_name_tool_change(lib, lib_name(lib), dst)
+
+        remove_absolute_rpaths(dst)
+
+    for lib in libs_dyn:
+        install_name_tool_change(lib, lib_name(lib), binary)
+
+
+def process_swift_libraries(binary: str) -> None:
+    swift_stdlib_tool: str = subprocess.check_output(
+        ["xcrun", "--find", "swift-stdlib-tool"],
+        universal_newlines=True,
+    ).strip()
+    # from xcode11 on the dynamic swift libs reside in a separate directory from
+    # the std one, might need versioned paths for future swift versions
+    swift_lib_path: str = os.path.join(swift_stdlib_tool, "../../lib/swift-5.0/macosx")
+    swift_lib_path = os.path.abspath(swift_lib_path)
+
+    command: list[str] = [
+        swift_stdlib_tool,
+        "--copy",
+        "--platform",
+        "macosx",
+        "--scan-executable",
+        binary,
+        "--destination",
+        lib_path(binary),
+    ]
+
+    if os.path.exists(swift_lib_path):
+        command.extend(["--source-libraries", swift_lib_path])
+
+    _ = subprocess.check_output(command, universal_newlines=True)
+
+    print(">> setting additional rpath for swift libraries")
+    install_name_tool_add_rpath("@executable_path/lib", binary)
+
+
+def process_vulkan_loader(
+    binary: str, loader_name: str, loader_relative_folder: str, library_node: str
+) -> None:
+    # https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#example-macos-driver-search-path
+    # https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md#macos-layer-discovery
+    loader_system_search_folders: list[str] = [
+        os.path.join(os.path.expanduser("~"), ".config", loader_relative_folder),
+        os.path.join("/etc/xdg", loader_relative_folder),
+        os.path.join("/usr/local/etc", loader_relative_folder),
+        os.path.join("/etc", loader_relative_folder),
+        os.path.join(os.path.expanduser("~"), ".local/share", loader_relative_folder),
+        os.path.join("/usr/local/share", loader_relative_folder),
+        os.path.join("/usr/share/vulkan", loader_relative_folder),
+        os.path.join(get_homebrew_prefix(), "etc", loader_relative_folder),
+        os.path.join(
+            get_homebrew_prefix(), "share", loader_relative_folder
+        ),  # old location
+    ]
+
+    loader_system_folder: str = ""
+    for loader_system_search_folder in loader_system_search_folders:
+        if os.path.exists(loader_system_search_folder):
+            loader_system_folder = loader_system_search_folder
+            break
+
+    if not loader_system_folder:
+        print(">>> could not find loader folder " + loader_relative_folder)
+        return
+
+    loader_bundle_folder: str = os.path.join(resources_path(binary), loader_relative_folder)
+    loader_system_path: str = os.path.join(loader_system_folder, loader_name)
+    loader_bundle_path: str = os.path.join(loader_bundle_folder, loader_name)
+    library_relative_folder: str = "../../../Frameworks/"
+
+    if not os.path.exists(loader_system_path):
+        print(">>> could not find loader " + loader_name)
+        return
+
+    if not os.path.exists(loader_bundle_folder):
+        os.makedirs(loader_bundle_folder)
+
+    with open(loader_system_path, encoding="utf-8") as loader_system_file:
+        loader_json_data: _VulkanLoaderJson = cast(_VulkanLoaderJson, json.load(loader_system_file))
+    library_data_dict = loader_json_data[library_node]
+    library_path: str = library_data_dict["library_path"]
+    library_system_path: str = os.path.join(loader_system_folder, library_path)
+
+    if not os.path.exists(library_system_path):
+        print(">>> could not find loader library " + library_system_path)
+        return
+
+    print(">>> modifying and writing loader json " + loader_name)
+    loader_library_name: str = os.path.basename(library_system_path)
+    library_path = os.path.join(library_relative_folder, loader_library_name)
+    library_data_dict["library_path"] = library_path
+    with open(loader_bundle_path, "w", encoding="utf-8") as loader_bundle_file:
+        json.dump(loader_json_data, loader_bundle_file, indent=4)
+
+    print(">>> copying loader library " + loader_library_name)
+    framework_bundle_folder: str = os.path.join(
+        loader_bundle_folder,
+        library_relative_folder,
+    )
+    if not os.path.exists(framework_bundle_folder):
+        os.makedirs(framework_bundle_folder)
+    library_target_path: str = os.path.join(framework_bundle_folder, loader_library_name)
+    _ = shutil.copy(library_system_path, library_target_path)
+
+
+def remove_dev_tools_rapths(binary: str) -> None:
+    for path in get_rpaths_dev_tools(binary):
+        install_name_tool_delete_rpath(path, binary)
+
+
+# Correct spelling alias
+remove_dev_tools_rpaths = remove_dev_tools_rapths
+
+
+def process(binary: str) -> None:
+    binary = os.path.abspath(binary)
+    if not os.path.exists(lib_path(binary)):
+        os.makedirs(lib_path(binary))
+    print(">> gathering all linked libraries")
+    libs: dict[str, set[str]]
+    libs_rel: set[str]
+    libs, libs_rel = libraries(binary)
+
+    print(">> copying and processing all linked libraries")
+    process_libraries(libs, libs_rel, binary)
+
+    print(">> removing absolute rpath definitions")
+    remove_absolute_rpaths(binary)
+
+    print(">> copying and processing swift libraries")
+    process_swift_libraries(binary)
+
+    print(">> copying and processing vulkan loader")
+    process_vulkan_loader(binary, "MoltenVK_icd.json", "vulkan/icd.d", "ICD")
+    if check_vulkan_max_version("1.3.261.1"):
+        process_vulkan_loader(
+            binary,
+            "VkLayer_khronos_synchronization2.json",
+            "vulkan/explicit_layer.d",
+            "layer",
+        )
+
+
+if __name__ == "__main__":
+    process(sys.argv[1])

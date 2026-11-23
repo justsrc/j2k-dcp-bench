@@ -1,0 +1,474 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig:/opt/homebrew/opt/glslang/lib/pkgconfig:/opt/homebrew/opt/libarchive/lib/pkgconfig:/opt/homebrew/opt/libxml2/lib/pkgconfig
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - name: Check out build definition
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify Apple Silicon runner and toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
+          clang --version | head -1
+
+      - name: Load pinned versions
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' versions.env >> "$GITHUB_ENV"
+
+      - name: Set workspace paths
+        run: |
+          # Build under /private/tmp: /Users/runner would otherwise be embedded
+          # in FFmpeg's configure line and mpv's Configuration string. /private/tmp
+          # is a generic path (the gate only rejects /Users and /var/folders).
+          echo "J2K_ROOT=/private/tmp/j2k-install" >> "$GITHUB_ENV"
+          echo "MPV_BUILD_ROOT=/private/tmp/mpv-build" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ env.J2K_SHA }}-${{ hashFiles('patches/j2k/*.patch') }}-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Cache j2k build
+        uses: actions/cache@v6
+        with:
+          path: j2k/target
+          key: j2k-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ env.J2K_SHA }}-${{ hashFiles('patches/j2k/*.patch') }}-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Build libj2k static library
+        run: |
+          set -euo pipefail
+          git init --quiet j2k
+          git -C j2k remote add origin https://github.com/frames-sg/j2k.git
+          git -C j2k fetch --depth=1 origin "$J2K_SHA"
+          git -C j2k checkout --detach --quiet FETCH_HEAD
+          git -C j2k apply "$GITHUB_WORKSPACE/patches/j2k/j2k-dcp.patch"
+          git -C j2k apply "$GITHUB_WORKSPACE/patches/j2k/j2k-dcp-hygiene.patch"
+          export RUSTFLAGS="--remap-path-prefix=$HOME=. --remap-path-prefix=$RUNNER_TEMP=. --remap-path-prefix=$GITHUB_WORKSPACE=."
+          pushd j2k >/dev/null
+          cargo build --release --locked -p j2k-c --features metal
+          popd >/dev/null
+          install -d "$J2K_ROOT/include" "$J2K_ROOT/lib"
+          install -m 0644 j2k/crates/j2k-c/include/j2k.h "$J2K_ROOT/include/j2k.h"
+          install -m 0644 j2k/target/release/libj2k_c.a "$J2K_ROOT/lib/libj2k_c.a"
+          test ! -e "$J2K_ROOT/lib/libj2k_c.dylib"
+          ls -lh "$J2K_ROOT/lib/libj2k_c.a" "$J2K_ROOT/include/j2k.h"
+
+      - name: Install Homebrew dependencies
+        run: |
+          set -euo pipefail
+          # Full dependency set of the reference justsrc/mpv-builder nightly
+          # (plus jq/nasm for this workflow), so codec, filter, DoVi and
+          # player-integration coverage matches that build. `dovi_tool`
+          # provides libdovi, which libplacebo uses for Dolby Vision.
+          brew install \
+            aom \
+            aribb24 \
+            autoconf \
+            automake \
+            dav1d \
+            docutils \
+            dovi_tool \
+            fontconfig \
+            frei0r \
+            freetype \
+            fribidi \
+            game-music-emu \
+            glslang \
+            gmp \
+            gnutls \
+            harfbuzz \
+            icu4c@78 \
+            jpeg-xl \
+            jq \
+            lame \
+            lcms2 \
+            libarchive \
+            libass \
+            libbluray \
+            libcaca \
+            libcdio \
+            libcdio-paranoia \
+            libdvdnav \
+            libdvdread \
+            libmodplug \
+            libogg \
+            libplacebo \
+            librist \
+            librsvg \
+            libsixel \
+            libsoxr \
+            libssh \
+            libtool \
+            libvidstab \
+            libvmaf \
+            libvorbis \
+            libvpx \
+            libxml2 \
+            libzip \
+            luajit \
+            meson \
+            molten-vk \
+            mujs \
+            nasm \
+            ninja \
+            opencore-amr \
+            openjpeg \
+            openssl@3 \
+            opus \
+            pkg-config \
+            qrencode \
+            rav1e \
+            rubberband \
+            samba \
+            shaderc \
+            snappy \
+            speex \
+            srt \
+            svt-av1 \
+            tesseract \
+            theora \
+            uchardet \
+            vapoursynth \
+            vulkan-loader \
+            webp \
+            whisper.cpp \
+            x264 \
+            x265 \
+            xvid \
+            xxhash \
+            zeromq \
+            zimg
+
+      - name: Clone pinned mpv-build
+        run: |
+          set -euo pipefail
+          rm -rf "$MPV_BUILD_ROOT"
+          git init --quiet "$MPV_BUILD_ROOT"
+          git -C "$MPV_BUILD_ROOT" remote add origin https://github.com/mpv-player/mpv-build.git
+          git -C "$MPV_BUILD_ROOT" fetch --depth=1 origin "$MPV_BUILD_SHA"
+          git -C "$MPV_BUILD_ROOT" checkout --detach --quiet FETCH_HEAD
+
+      - name: Fetch pinned sources
+        run: |
+          set -euo pipefail
+          pushd "$MPV_BUILD_ROOT" >/dev/null
+          ./use-mpv-master
+          ./use-ffmpeg-custom "$FFMPEG_SHA"
+          ./use-libass-custom "$LIBASS_SHA"
+          ./use-libplacebo-custom "$LIBPLACEBO_SHA"
+          ./update --skip-selfupdate
+          git -C mpv fetch --depth=1 origin "$MPV_SHA"
+          git -C mpv checkout --detach --quiet FETCH_HEAD
+          SOURCE_DATE_EPOCH="$(git -C mpv show -s --format=%ct HEAD)"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+          popd >/dev/null
+
+      - name: Apply JPEG 2000 patches to FFmpeg
+        run: |
+          set -euo pipefail
+          FF="$MPV_BUILD_ROOT/ffmpeg"
+          for patch in "$GITHUB_WORKSPACE"/patches/ffmpeg/0*.patch; do
+            echo "applying $(basename "$patch")"
+            git -C "$FF" apply "$patch"
+          done
+          git -C "$FF" apply "$GITHUB_WORKSPACE/patches/ffmpeg/libj2k-wiring.patch"
+          install -m 0644 "$GITHUB_WORKSPACE/patches/ffmpeg/libj2kdec.c" \
+            "$FF/libavcodec/libj2kdec.c"
+          count="$(git -C "$FF" status --porcelain | wc -l | tr -d ' ')"
+          # 15 files from the codec series, 3 configuration files from the
+          # libj2k wiring patch, and the decoder source copied above.
+          test "$count" = "19"
+          git -C "$FF" status --porcelain
+
+      - name: Configure build options
+        run: |
+          set -euo pipefail
+          # mpv-build passes every line of these files as an argv token to
+          # configure/meson, so comments must be stripped before copying.
+          grep -Ev '^[[:space:]]*(#|$)' "$GITHUB_WORKSPACE/options/ffmpeg_options" > "$MPV_BUILD_ROOT/ffmpeg_options"
+          # Prefix maps go through CFLAGS/OBJCFLAGS in the build step, not
+          # --extra-cflags: configure embeds its arguments in the binary, and
+          # an absolute $GITHUB_WORKSPACE there would leak /Users/runner.
+          # Keep the 9/7 float lifting steps free of fused multiply-adds so
+          # the output stays bit-identical to the scalar schedule.
+          printf '%s\n' \
+            "--extra-cflags=-I/opt/homebrew/include -I$J2K_ROOT/include -ffp-contract=off" \
+            "--extra-ldflags=-L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -framework Foundation -lobjc" \
+            >> "$MPV_BUILD_ROOT/ffmpeg_options"
+          grep -Ev '^[[:space:]]*(#|$)' "$GITHUB_WORKSPACE/options/mpv_options" > "$MPV_BUILD_ROOT/mpv_options"
+          printf '%s\n' \
+            "-Dc_link_args=-L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -framework Foundation -lobjc" \
+            "-Dobjc_link_args=-framework Foundation -L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -lobjc" \
+            >> "$MPV_BUILD_ROOT/mpv_options"
+          echo "--- ffmpeg_options ---"
+          cat "$MPV_BUILD_ROOT/ffmpeg_options"
+          echo "--- mpv_options ---"
+          cat "$MPV_BUILD_ROOT/mpv_options"
+
+      - name: Build mpv against patched FFmpeg
+        run: |
+          set -euo pipefail
+          export CFLAGS="-I/opt/homebrew/include -I$J2K_ROOT/include -ffp-contract=off -ffile-prefix-map=/private/tmp=. -ffile-prefix-map=$GITHUB_WORKSPACE=."
+          export OBJCFLAGS="$CFLAGS"
+          export LDFLAGS="-L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -framework Foundation -lobjc"
+          pushd "$MPV_BUILD_ROOT" >/dev/null
+          ./clean
+          ./build
+          popd >/dev/null
+
+      - name: Run mpv unit tests
+        run: |
+          set -euo pipefail
+          pushd "$MPV_BUILD_ROOT/mpv" >/dev/null
+          # Freshly linked test binaries load ~150 Homebrew dylibs; on a cold
+          # first launch macOS can spend tens of seconds scanning/loading them.
+          # 3x the default keeps a real hang failing at 90 s while not turning
+          # that cold start into a spurious timeout.
+          meson test -C build --print-errorlogs --timeout-multiplier 3
+          popd >/dev/null
+
+      - name: Bundle mpv.app
+        run: |
+          set -euo pipefail
+          pushd "$MPV_BUILD_ROOT" >/dev/null
+          mkdir -p mpv/TOOLS
+          cp "$GITHUB_WORKSPACE/scripts/osxbundle.py" mpv/TOOLS/osxbundle.py
+          cp "$GITHUB_WORKSPACE/scripts/dylib_unhell.py" mpv/TOOLS/dylib_unhell.py
+          pushd mpv >/dev/null
+          python3 TOOLS/osxbundle.py build/mpv .
+          popd >/dev/null
+          popd >/dev/null
+
+      - name: Verify decoder and bundled linkage
+        run: |
+          set -euo pipefail
+          # strings output is arbitrary bytes, not text. BSD sed in a UTF-8
+          # locale aborts with "RE error: illegal byte sequence" on any
+          # non-UTF-8 byte (one bundled Homebrew dylib has such bytes), so do
+          # this scan byte-for-byte and independently of the runner's locale.
+          export LC_ALL=C
+          APP="$MPV_BUILD_ROOT/mpv/build/mpv.app"
+          BIN="$APP/Contents/MacOS/mpv"
+          test -x "$BIN"
+          "$BIN" --no-config --version
+          "$BIN" --no-config --vd=help > /tmp/vd_help.txt 2>&1
+          if ! grep -qw 'libj2k' /tmp/vd_help.txt; then
+            echo "::error::libj2k decoder is not listed by --vd=help"
+            exit 1
+          fi
+          if ! grep -qw 'jpeg2000' /tmp/vd_help.txt; then
+            echo "::error::native jpeg2000 decoder is not listed by --vd=help"
+            exit 1
+          fi
+          strings -a "$BIN" > /tmp/bin_strings.txt
+          if grep -q -- '--enable-nonfree' /tmp/bin_strings.txt; then
+            echo "::error::FFmpeg configuration still contains --enable-nonfree"
+            exit 1
+          fi
+          if grep -q 'nonfree and unredistributable' /tmp/bin_strings.txt; then
+            echo "::error::an FFmpeg library still reports a nonfree license"
+            exit 1
+          fi
+          if ! grep -q 'license: GPL version 3 or later' /tmp/bin_strings.txt; then
+            echo "::error::expected GPL version 3 or later FFmpeg license string"
+            exit 1
+          fi
+          otool -L "$BIN" > /tmp/otool_bin.txt
+          if grep -qi 'j2k' /tmp/otool_bin.txt; then
+            echo "::error::libj2k must be linked statically, not dynamically"
+            exit 1
+          fi
+          # Write the symbol table to a file first: `nm | grep -q` closes the
+          # pipe on the first match, and with `set -o pipefail` nm's SIGPIPE
+          # then fails the pipeline even though the symbol was found.
+          nm -g "$BIN" > /tmp/mpv_symbols.txt
+          if ! grep -q '_j2k_abi_version' /tmp/mpv_symbols.txt; then
+            echo "::error::static libj2k symbols missing from mpv binary"
+            grep -i 'j2k' /tmp/mpv_symbols.txt | head -20 || true
+            exit 1
+          fi
+          # Do not pipe find into grep -q: under pipefail, grep closing the
+          # pipe on the first match makes find die of SIGPIPE and the pipeline
+          # report 141, so a bundled libj2k would silently go undetected.
+          if [ -n "$(find "$APP" -name 'libj2k*' -print -quit)" ]; then
+            echo "::error::libj2k must be linked statically, not bundled"
+            exit 1
+          fi
+          bad=0
+          check_macho() {
+            local f="$1" lib rp own_id
+            echo "== $f"
+            # Capture each tool's output in a file before looping. Process
+            # substitution does not propagate the tool's exit status, so a
+            # failing otool would make the dependency/rpath loops run zero
+            # times and the file would pass vacuously. strings is captured
+            # here so a failure cannot look like "no leaks"; the final
+            # `|| true` below only absorbs grep's expected no-match status.
+            otool -L "$f" > /tmp/gate_deps_raw.txt || {
+              echo "::error::otool -L failed for $f"; exit 1; }
+            otool -l "$f" > /tmp/gate_loadcmds.txt || {
+              echo "::error::otool -l failed for $f"; exit 1; }
+            strings -a "$f" > /tmp/gate_strings.txt || {
+              echo "::error::strings failed for $f"; exit 1; }
+            # The dylib's own LC_ID_DYLIB reappears in otool -L; comparing it
+            # to `otool -D` is the ONLY skip. This is safe: the bundle is
+            # arm64-only (no universal binaries), and the one absolute install
+            # name (MoltenVK) is copied verbatim into Frameworks. A failing
+            # `otool -D` would report the own ID as an external dependency,
+            # i.e. a false failure, never a false pass.
+            own_id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1 || true)"
+            tail -n +2 /tmp/gate_deps_raw.txt | awk '{print $1}' \
+              > /tmp/gate_deps.txt
+            while IFS= read -r lib; do
+              if [ -n "$own_id" ] && [ "$lib" = "$own_id" ]; then
+                continue
+              fi
+              case "$lib" in
+                @executable_path*|@loader_path*|@rpath*|/usr/lib*|/System*) ;;
+                *) echo "::error::external dependency in $f: $lib"; bad=1 ;;
+              esac
+            done < /tmp/gate_deps.txt
+            awk '/LC_RPATH/{getline; getline; sub(/^[[:space:]]*path /,""); sub(/ \(offset [0-9]+\)$/,""); print}' \
+              /tmp/gate_loadcmds.txt > /tmp/gate_rpaths.txt
+            while IFS= read -r rp; do
+              # /usr/lib/swift is the OS Swift runtime added by the toolchain;
+              # it is a system path, like the /usr/lib dependencies above.
+              case "$rp" in
+                @executable_path*|@loader_path*|/usr/lib*|/System*) ;;
+                *) echo "::error::absolute LC_RPATH in $f: $rp"; bad=1 ;;
+              esac
+            done < /tmp/gate_rpaths.txt
+            # Only build-machine roots are fatal. `/var/folders/` also matches
+            # the `/private/var/folders/` form (macOS TMPDIR is usually written
+            # without the `/private` prefix). Third-party dylibs may
+            # legitimately contain compiled-in defaults such as
+            # /opt/homebrew/etc/fonts (fontconfig), a /tmp capture-pipe
+            # template (MoltenVK), or /Users/brew cargo paths (Homebrew's
+            # libdovi bottle); those are not load paths and do not break the
+            # bundle. Dependencies and rpaths are checked above.
+            # This sed runs under the step's `set -euo pipefail`, so a failure
+            # aborts the step before the grep. Do not add `|| true` here.
+            sed -E 's#/Users/brew/[^[:space:]]*##g' /tmp/gate_strings.txt \
+              > /tmp/gate_leaks.txt
+            leaks="$(grep -E '(/Users/|/var/folders/)' /tmp/gate_leaks.txt \
+              | sort -u | head -20 || true)"
+            if [ -n "$leaks" ]; then
+              echo "::error::build-machine path in $f"
+              echo "$leaks"
+              bad=1
+            fi
+          }
+          check_macho "$BIN"
+          # dylib_unhell.py bundles libraries into Contents/MacOS/lib.
+          for f in "$APP"/Contents/Frameworks/* "$APP"/Contents/MacOS/lib/*; do
+            if [ -f "$f" ]; then
+              check_macho "$f"
+            fi
+          done
+          exit "$bad"
+
+      - name: Run JPEG 2000 style and source gate
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/tests/j2kstyles.sh" \
+            "$MPV_BUILD_ROOT/ffmpeg/ffmpeg"
+
+      - name: Smoke-test both JPEG 2000 decoders
+        run: |
+          set -euo pipefail
+          APP="$MPV_BUILD_ROOT/mpv/build/mpv.app"
+          BIN="$APP/Contents/MacOS/mpv"
+          FFMPEG="$MPV_BUILD_ROOT/ffmpeg/ffmpeg"
+          test -x "$FFMPEG"
+          "$FFMPEG" -y -v error -f lavfi \
+            -i testsrc2=size=1280x720:rate=24:duration=2 \
+            -pix_fmt yuv444p12le -c:v jpeg2000 -pred 0 -format j2k \
+            -tile_width 1280 -tile_height 720 -layer_rates 1 -f mxf \
+            /private/tmp/j2k-smoke.mxf
+          "$BIN" --no-config --vd=jpeg2000 --vo=null --ao=null --untimed \
+            --frames=10 --really-quiet /private/tmp/j2k-smoke.mxf
+          "$BIN" --no-config --vd=libj2k --vo=null --ao=null --untimed \
+            --frames=10 --really-quiet /private/tmp/j2k-smoke.mxf
+          echo "both decoders decoded the smoke clip"
+
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          APP="$MPV_BUILD_ROOT/mpv/build/mpv.app"
+          BIN="$APP/Contents/MacOS/mpv"
+          mkdir -p dist
+          "$BIN" --no-config --vd=help > dist/vd_help.txt
+          "$BIN" --no-config --ad=help > dist/ad_help.txt
+          "$BIN" --no-config --af=help > dist/af_help.txt
+          "$BIN" --no-config --ao=help > dist/ao_help.txt
+          strings -a "$BIN" | grep -m1 -- '--prefix=' > dist/ffmpeg_configure.txt || true
+          strings -a "$BIN" | grep -E '^libav[a-z]+ license: ' > dist/ffmpeg_license.txt || true
+          find "$GITHUB_WORKSPACE/patches/ffmpeg" -maxdepth 1 -name '*.patch' \
+            -exec basename {} \; | sort > dist/ffmpeg_patches.txt
+          codec_patches="$(find "$GITHUB_WORKSPACE/patches/ffmpeg" \
+            -maxdepth 1 -name '0*.patch' | wc -l | tr -d ' ')"
+          test "$codec_patches" = "11"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/mpv-j2k-dcp-macos-arm64.zip
+          shasum -a 256 dist/mpv-j2k-dcp-macos-arm64.zip | tee dist/SHA256SUMS.txt
+          jq -n \
+            --arg mpv_sha "$MPV_SHA" \
+            --arg mpv_build_sha "$MPV_BUILD_SHA" \
+            --arg ffmpeg_sha "$FFMPEG_SHA" \
+            --argjson ffmpeg_patches "$codec_patches" \
+            --arg libass_sha "$LIBASS_SHA" \
+            --arg libplacebo_sha "$LIBPLACEBO_SHA" \
+            --arg j2k_sha "$J2K_SHA" \
+            --arg libdovi "$(pkg-config --modversion dovi)" \
+            --arg rust "$RUST_TOOLCHAIN" \
+            --arg runner "$ImageOS" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg ffmpeg_license "GPL-3.0-or-later" \
+            '{artifact:"mpv-j2k-dcp-macos-arm64.zip", mpv_sha:$mpv_sha, mpv_build_sha:$mpv_build_sha, ffmpeg_sha:$ffmpeg_sha, ffmpeg_patches:$ffmpeg_patches, libass_sha:$libass_sha, libplacebo_sha:$libplacebo_sha, j2k_sha:$j2k_sha, libdovi:$libdovi, rust:$rust, runner:$runner, run_url:$run_url, built_at:$built_at, ffmpeg_license:$ffmpeg_license}' \
+            > dist/build-metadata.json
+          cat dist/build-metadata.json
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mpv-j2k-dcp-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
