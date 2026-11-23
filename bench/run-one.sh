@@ -1,39 +1,126 @@
 #!/bin/bash
-# Run one player/decoder pair over a fixed number of frames and print
-# real, user and sys seconds as a tab-separated row.
+# Run one player/decoder pair and print real, user and sys seconds plus the
+# last frame-drop count and its label, as a tab-separated row.
 #
-# usage: run-one.sh PLAYER DECODER MEDIA FRAMES THREADS
+# usage: run-one.sh PLAYER DECODER MEDIA FRAMES THREADS [MODE]
+#
+# Modes:
+#   headless        null video, no audio, untimed
+#   headless-audio  null video and audio output, audio decoded, untimed
+#   gpu             GPU video, no audio, untimed
+#   gpu-audio       GPU video, CoreAudio output, untimed
+#   playback-video  GPU video, no audio, real time
+#   playback        GPU video, CoreAudio output, real time
+#
+# MODE is used when the sixth argument is omitted.
+#
+# Set LOG_DIR to keep the player output for each run. Set LOG_NAME to name
+# the file inside that directory. Set TOKEN to add a report marker to the
+# status line so a run can be found in a windowed player.
 set -euo pipefail
 
-player=${1:?usage: run-one.sh PLAYER DECODER MEDIA FRAMES THREADS}
+player=${1:?usage: run-one.sh PLAYER DECODER MEDIA FRAMES THREADS [MODE]}
 decoder=${2:?}
 media=${3:?}
 frames=${4:?}
 threads=${5:?}
+mode=${6:-${MODE:-headless}}
 
 [[ -x "$player" ]] || { echo "not executable: $player" >&2; exit 2; }
 [[ -f "$media" ]]   || { echo "not a file: $media" >&2; exit 2; }
 
+status_msg='STATUS drop=${=frame-drop-count} mistimed=${=mistimed-frame-count} vf=${=estimated-vf-fps} time=${=playback-time}'
+
+args=(--no-config --no-audio --vd="$decoder" --vd-lavc-threads="$threads")
+case "$mode" in
+    headless)
+        args+=(--vo=null --ao=null --untimed)
+        ;;
+    headless-audio)
+        args=(--no-config --vd="$decoder" --vd-lavc-threads="$threads")
+        args+=(--vo=null --ao=null --untimed)
+        ;;
+    gpu)
+        args+=(--vo=gpu-next --ao=null --untimed)
+        ;;
+    gpu-audio)
+        args=(--no-config --vd="$decoder" --vd-lavc-threads="$threads")
+        args+=(--vo=gpu-next --ao=coreaudio --untimed)
+        ;;
+    playback-video)
+        args+=(--vo=gpu-next --ao=null)
+        args+=(--term-osd=force "--term-status-msg=$status_msg")
+        ;;
+    playback)
+        args=(--no-config --vd="$decoder" --vd-lavc-threads="$threads")
+        args+=(--vo=gpu-next --ao=coreaudio)
+        args+=(--term-osd=force "--term-status-msg=$status_msg")
+        ;;
+    *)
+        echo "unknown mode: $mode" >&2
+        exit 2
+        ;;
+esac
+
+args+=(--frames="$frames")
+if [[ "$mode" != playback* ]]; then
+    args+=(--really-quiet)
+fi
+if [[ -n ${TOKEN:-} ]]; then
+    args+=(--title="$TOKEN")
+fi
+args+=("$media")
+
 time_file=$(mktemp)
 trap 'rm -f "$time_file"' EXIT
 
-# --no-config keeps the measurement independent of the user's mpv.conf.
-# --vo=null and --ao=null remove GPU and audio from the path; --untimed
-# decodes as fast as the machine allows instead of at the presentation rate.
-/usr/bin/time -p -o "$time_file" \
-    "$player" --no-config --no-audio \
-    --vd="$decoder" --vo=null --ao=null --untimed \
-    --vd-lavc-threads="$threads" \
-    --frames="$frames" --really-quiet \
-    "$media" >/dev/null 2>&1
+run_log=
+if [[ -n ${LOG_DIR:-} ]]; then
+    mkdir -p "$LOG_DIR"
+    run_log="$LOG_DIR/${LOG_NAME:-$mode}.log"
+    {
+        printf 'command:'
+        printf ' %q' "$player" "${args[@]}"
+        printf '\n'
+    } > "$run_log"
+fi
 
-awk '
+set +e
+if [[ -n "$run_log" ]]; then
+    /usr/bin/time -p -o "$time_file" "$player" "${args[@]}" \
+        >> "$run_log" 2>&1
+else
+    /usr/bin/time -p -o "$time_file" "$player" "${args[@]}" \
+        > /dev/null 2>&1
+fi
+status=$?
+set -e
+
+drops=
+if [[ -n "$run_log" ]]; then
+    printf 'exit: %d\n' "$status" >> "$run_log"
+    cat "$time_file" >> "$run_log"
+    drops=$(tr '\r' '\n' < "$run_log" |
+            sed -n 's/.*STATUS drop=\([0-9][0-9]*\).*/\1/p' |
+            tail -1)
+    if [[ -z "$drops" ]] && tr '\r' '\n' < "$run_log" | grep -q 'STATUS drop='; then
+        drops=0
+    fi
+    printf 'drops: %s\n' "${drops:-none}" >> "$run_log"
+fi
+
+if [[ $status -ne 0 ]]; then
+    echo "player exited with $status ($mode, $decoder)" >&2
+    exit "$status"
+fi
+
+awk -v drops="${drops:-}" '
     $1 == "real" { real = $2 }
     $1 == "user" { user = $2 }
     $1 == "sys"  { sys  = $2 }
     END {
         if (real == "")
             exit 1
-        printf "%.3f\t%.3f\t%.3f\n", real, user, sys
+        printf "%.3f\t%.3f\t%.3f\t%s\n", real, user, sys, drops
     }
 ' "$time_file"
