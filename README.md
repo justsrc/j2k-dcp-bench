@@ -52,7 +52,8 @@ libj2k decoder.
 
 ## Patches
 
-The native series makes four changes to the decode path.
+The native series changes the DWT, the multi-component transform, tier-1 and
+the output path.
 
 | Patch | Change |
 | --- | --- |
@@ -78,11 +79,10 @@ git -C ffmpeg checkout 359c82515228774eb683dffce9d623b6b4a2fa53
 git -C ffmpeg am /path/to/j2k-dcp-bench/patches/ffmpeg/0*.patch
 ```
 
-The series keeps floating-point results bit-identical to the unpatched decoder
-only when the compiler does not contract expressions into fused multiply-adds.
-Build with `-ffp-contract=off`, as the workflow does, if you compare frame
-hashes. Without it, arm64 clang may fuse operations in the float DWT and the
-last bits can differ.
+The series keeps the operand order and evaluation order of the floating-point
+lifting steps. It was verified bit-identical to the unpatched decoder when both
+were built with the same compiler and flags. If you compare frame hashes, use
+the same compiler, optimization level and floating-point flags for both trees.
 
 The wire patch adds `--enable-libj2k` and a decoder wrapper. It is independent
 of the native series and can be omitted if only `--vd=jpeg2000` is needed.

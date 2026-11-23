@@ -24,10 +24,11 @@ libplacebo sources, applies the patches, and runs mpv-build's `build` target.
 It builds on a GitHub-hosted `xcode-27` arm64 runner and writes to
 `/private/tmp`, so build-machine paths do not end up in the binary.
 
-FFmpeg and mpv are compiled with `-ffp-contract=off`. The 9/7 float DWT
-patches reorder lifting operations but keep their operand order. Fused
-multiply-adds would still change rounding, so the flag is required for the
-frame hashes to match the unpatched decoder.
+FFmpeg and mpv are built with the same compiler and flags as the reference
+build. The 9/7 float DWT patches reorder lifting operations but keep their
+operand and evaluation order, so the output stays bit-identical to the
+unpatched decoder when both trees use the same flags. The frame-hash gate
+would not be meaningful across different floating-point flags.
 
 The workflow checks:
 

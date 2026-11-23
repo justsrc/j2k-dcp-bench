@@ -224,10 +224,8 @@ jobs:
           # Prefix maps go through CFLAGS/OBJCFLAGS in the build step, not
           # --extra-cflags: configure embeds its arguments in the binary, and
           # an absolute $GITHUB_WORKSPACE there would leak /Users/runner.
-          # Keep the 9/7 float lifting steps free of fused multiply-adds so
-          # the output stays bit-identical to the scalar schedule.
           printf '%s\n' \
-            "--extra-cflags=-I/opt/homebrew/include -I$J2K_ROOT/include -ffp-contract=off" \
+            "--extra-cflags=-I/opt/homebrew/include -I$J2K_ROOT/include" \
             "--extra-ldflags=-L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -framework Foundation -lobjc" \
             >> "$MPV_BUILD_ROOT/ffmpeg_options"
           grep -Ev '^[[:space:]]*(#|$)' "$GITHUB_WORKSPACE/options/mpv_options" > "$MPV_BUILD_ROOT/mpv_options"
@@ -243,7 +241,7 @@ jobs:
       - name: Build mpv against patched FFmpeg
         run: |
           set -euo pipefail
-          export CFLAGS="-I/opt/homebrew/include -I$J2K_ROOT/include -ffp-contract=off -ffile-prefix-map=/private/tmp=. -ffile-prefix-map=$GITHUB_WORKSPACE=."
+          export CFLAGS="-I/opt/homebrew/include -I$J2K_ROOT/include -ffile-prefix-map=/private/tmp=. -ffile-prefix-map=$GITHUB_WORKSPACE=."
           export OBJCFLAGS="$CFLAGS"
           export LDFLAGS="-L/opt/homebrew/lib -L$J2K_ROOT/lib -framework Metal -framework CoreFoundation -framework Foundation -lobjc"
           pushd "$MPV_BUILD_ROOT" >/dev/null
