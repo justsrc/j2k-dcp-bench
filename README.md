@@ -126,6 +126,10 @@ The player runs with `--no-config --vo=null --ao=null --untimed` and eight
 decoder threads, so the measurement covers decoding and not presentation.
 Raw rows are written to `bench-results.tsv`.
 
+The workflow does not run this benchmark. Shared CI runners are not a stable
+timing environment. The workflow builds the app and checks correctness; run the
+timings on your own machine.
+
 For a real DCP, cut a stream copy from a picture MXF you own instead of using
 the synthetic clip:
 

@@ -76,6 +76,10 @@ tests/j2kstyles.sh /path/to/ffmpeg
 
 ## Benchmark
 
+CI does not run the benchmark. The workflow builds the app and runs correctness
+checks; timing on a shared runner is not comparable between runs. Run the
+benchmark on your own machine.
+
 `bench/make-clip.sh` encodes a synthetic clip with the same geometry and
 transform as the DCP excerpt:
 
