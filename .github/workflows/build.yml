@@ -404,14 +404,14 @@ jobs:
         run: |
           set -euo pipefail
           "$GITHUB_WORKSPACE/tests/j2kstyles.sh" \
-            "$MPV_BUILD_ROOT/ffmpeg/ffmpeg"
+            "$MPV_BUILD_ROOT/build_libs/bin/ffmpeg"
 
       - name: Smoke-test both JPEG 2000 decoders
         run: |
           set -euo pipefail
           APP="$MPV_BUILD_ROOT/mpv/build/mpv.app"
           BIN="$APP/Contents/MacOS/mpv"
-          FFMPEG="$MPV_BUILD_ROOT/ffmpeg/ffmpeg"
+          FFMPEG="$MPV_BUILD_ROOT/build_libs/bin/ffmpeg"
           test -x "$FFMPEG"
           "$FFMPEG" -y -v error -f lavfi \
             -i testsrc2=size=1280x720:rate=24:duration=2 \
