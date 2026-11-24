@@ -88,10 +88,13 @@ bench/make-clip.sh clip.mxf 10 4096x1714
 ```
 
 That produces 240 frames at 24 fps, 4K scope, `yuv444p12le`, irreversible 9/7,
-with SOP and EPH markers, wrapped in MXF. To measure real programme material,
-cut a stream copy from a DCP picture MXF instead. Do not re-encode it.
+with SOP and EPH markers and a silent 5.1 PCM track, wrapped in MXF. The test
+pattern is denser than most film, so its bitrate is higher than a typical DCP
+and playback of it is a stress test. To measure real programme material, cut a
+stream copy from a DCP picture MXF instead. Do not re-encode it.
 
-`bench/run-one.sh` runs one player and decoder pair:
+`bench/run-one.sh` runs one player and decoder pair. The default mode is
+headless:
 
 ```sh
 mpv --no-config --no-audio --vd=jpeg2000 --vo=null --ao=null --untimed \
@@ -102,12 +105,55 @@ mpv --no-config --no-audio --vd=jpeg2000 --vo=null --ao=null --untimed \
 `--vo=null` and `--ao=null` remove presentation and audio. `--untimed` decodes
 as fast as the machine allows.
 
+The script also accepts `headless-audio`, `gpu`, `gpu-audio`,
+`playback-video` and `playback`. `headless-audio` sets `--ao-null-untimed` so
+the null audio device does not pace the run. `gpu-audio` and `playback` use
+CoreAudio, so their wall time is at least the audio duration. The last two use
+the normal clock with `gpu-next` and record `frame-drop-count`, which shows
+whether decoding keeps up with 24 fps. The audio modes decode the clip's PCM
+track.
+
+Set `SAMPLE_GPU=1` to record GPU utilization alongside a run. The player starts
+under `bench/gpu-sampler.sh`, which reads IOAccelerator's
+`Device Utilization %` once per second and writes `<log>.gpu.tsv`; a `gpu:`
+line with the average, peak and sample count is appended to the player log. The
+counter is the whole-GPU instantaneous percentage and is the only one macOS
+exposes without root. `powermetrics` needs sudo and would prompt, so the
+harness does not use it. CPU utilization is computed from `user + sys` seconds
+divided by real seconds, which is the average number of cores busy.
+
+Set `EXTRA_ARGS` to pass more player arguments. For example,
+`EXTRA_ARGS="--vd-lavc-o=backend=metal"` forces the `libj2k` Metal decoder
+instead of its default `auto` backend.
+
+`bench/verify.sh` checks the app before timing it: both decoders are present,
+both decode the full clip, the PCM track decodes without underruns, and sampled
+frames from the two decoders agree. `bench/matrix.sh` runs every mode for the
+baseline and both decoders and writes `results/summary.txt`.
+
+A DCP stores picture and sound in separate MXFs. Set `AUDIO_FILE` to the sound
+MXF and it is added with `--audio-file`, so the picture file does not need to be
+remuxed. `FRAMES` can be the whole feature. The full-feature run in
+`docs/RESULTS.md` used one round per mode because each round is 12 minutes:
+
+```sh
+MODE=playback FRAMES=17616 AUDIO_FILE=sound.mxf \
+    bench/ab.sh 1 17616 8 picture.mxf \
+    installed=/opt/homebrew/bin/mpv:jpeg2000 \
+    native=./mpv.app/Contents/MacOS/mpv:jpeg2000 \
+    libj2k=./mpv.app/Contents/MacOS/mpv:libj2k
+```
+
 `bench/ab.sh` runs every candidate once per round, in the same order, for five
 rounds. It reports the minimum real and user time per candidate, frames per
-second from the real time, and speedup relative to the first candidate.
+second from the real time, and speedup relative to the first candidate. For
+playback modes it reports the largest final drop count and CPU speedup instead,
+because wall time there is set by the player clock, not by decoder throughput: a
+player that cannot keep up stretches wall time as well as dropping frames.
+`bench/report.sh` renders the raw TSVs as Markdown tables.
 
 Minimum is used because scheduling, thermal and background-load noise only add
-time. The raw rows stay in `bench-results.tsv` so the distribution can be
+time. The raw rows stay in `results/<mode>.tsv` so the distribution can be
 checked.
 
 For stable numbers, run on AC power with no other heavy work, and let the

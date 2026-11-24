@@ -65,15 +65,26 @@ done
 
 echo
 echo "== audio decode"
-"$app" --no-config --vd=jpeg2000 --aid=1 --vd-lavc-threads="$threads" \
-    --vo=null --ao=null --untimed --frames="$frames" \
-    --msg-level=all=info "$media" > "$work/audio.log" 2>&1 \
-    || fail "audio decode failed"
-grep -q 'Audio.*pcm' "$work/audio.log" || fail "no PCM audio track in log"
-grep -q 'AO: \[null\]' "$work/audio.log" || fail "audio output did not open"
-grep -q 'Audio device underrun' "$work/audio.log" \
-    && fail "audio underrun while decoding to null output"
-echo "PCM audio track decoded, no underruns"
+have_audio=1
+if command -v ffprobe >/dev/null 2>&1; then
+    if [[ -z "$(ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 "$media")" ]]; then
+        have_audio=0
+    fi
+fi
+if [[ "$have_audio" == 0 ]]; then
+    echo "skip: no audio track"
+else
+    "$app" --no-config --vd=jpeg2000 --aid=1 --vd-lavc-threads="$threads" \
+        --vo=null --ao=null --untimed --frames="$frames" \
+        --msg-level=all=info "$media" > "$work/audio.log" 2>&1 \
+        || fail "audio decode failed"
+    grep -q 'Audio.*pcm' "$work/audio.log" || fail "no PCM audio track in log"
+    grep -q 'AO: \[null\]' "$work/audio.log" || fail "audio output did not open"
+    grep -q 'Audio device underrun' "$work/audio.log" \
+        && fail "audio underrun while decoding to null output"
+    echo "PCM audio track decoded, no underruns"
+fi
 
 echo
 echo "== sampled frame agreement"

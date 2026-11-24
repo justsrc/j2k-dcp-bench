@@ -13,3 +13,8 @@
 # Secrets
 .env
 .env.*
+
+# Benchmark outputs
+/bench-logs/
+/results/
+/bench-results*.tsv

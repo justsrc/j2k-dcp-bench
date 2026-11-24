@@ -73,16 +73,30 @@ awk -F'\t' -v frames="$frames" -v fps="$fps" -v mode="$mode" -v out="$out" '
             best_real[$2] = $3
             best_sys[$2] = $5
         }
-        if ($6 != "" && $6 + 0 > drops[$2])
-            drops[$2] = $6 + 0
+        if ($6 != "") {
+            d = $6 + 0
+            if (!($2 in drops) || d > drops[$2])
+                drops[$2] = d
+        }
     }
     END {
         if (n == 0) exit 1
         realtime = (mode ~ /^playback/)
+        audioclocked = (mode == "gpu-audio")
         base = best_real[order[1]]
         base_user = best_user[order[1]]
         printf "\nmode: %s\n", mode
-        if (realtime) {
+        if (audioclocked) {
+            printf "%-18s %10s %12s %10s %9s\n",
+                   "candidate", "min_real", "min_user", "sys", "cpu_speedup"
+            for (i = 1; i <= n; i++) {
+                l = order[i]
+                printf "%-18s %10.3f %12.3f %10.3f %8.2fx\n",
+                       l, best_real[l], best_user[l], best_sys[l],
+                       base_user / best_user[l]
+            }
+            printf "\nwall time includes the audio output clock; compare CPU time.\n"
+        } else if (realtime) {
             printf "%-18s %10s %12s %10s %9s %8s\n",
                    "candidate", "min_real", "min_user", "sys", "cpu_speedup", "drops"
             for (i = 1; i <= n; i++) {
@@ -94,7 +108,8 @@ awk -F'\t' -v frames="$frames" -v fps="$fps" -v mode="$mode" -v out="$out" '
             }
             printf "\nreal time includes player startup and the %.1f s media duration;\n",
                    frames / fps
-            printf "compare dropped frames, not wall time.\n"
+            printf "a player that cannot keep up stretches wall time and drops frames;\n"
+            printf "compare dropped frames and CPU time.\n"
         } else {
             printf "%-18s %10s %12s %10s %9s %9s\n",
                    "candidate", "min_real", "min_user", "sys", "fps", "speedup"

@@ -50,6 +50,15 @@ unzip mpv-j2k-dcp-macos-arm64.zip
 `--vd=jpeg2000` selects the patched native decoder. `--vd=libj2k` selects the
 libj2k decoder.
 
+The native patches are CPU work: NEON transforms and more efficient tier-1 and
+output loops. `jpeg2000` still decodes on the CPU. `gpu-next` uses the GPU to
+render the decoded frames in every mode. `libj2k` also has a Metal backend, but
+its default `auto` setting uses the CPU for classic JPEG 2000 and Metal only for
+HTJ2K, where the GPU is faster. To force the Metal decoder anyway, add
+`--vd-lavc-o=backend=metal`; `bench/run-one.sh` accepts the same through
+`EXTRA_ARGS`. On the measured content the forced backend is 2.4x slower in
+throughput and drops far more frames; `docs/RESULTS.md` has the comparison.
+
 ## Patches
 
 The native series changes the DWT, the multi-component transform, tier-1 and
@@ -112,30 +121,85 @@ Generate a synthetic 240-frame 4K scope clip at 24 fps with the irreversible
 bench/make-clip.sh clip.mxf 10 4096x1714
 ```
 
-Run an interleaved comparison. Each candidate runs once per round, in the same
+Check the app and the clip before timing anything:
+
+```sh
+APP=./mpv.app/Contents/MacOS/mpv MEDIA=clip.mxf bench/verify.sh
+```
+
+Run one interleaved comparison. Each candidate runs once per round, in the same
 order, and the script reports the minimum real and user time:
 
 ```sh
-bench/ab.sh 5 240 8 clip.mxf \
+MODE=headless bench/ab.sh 5 240 8 clip.mxf \
     installed=/opt/homebrew/bin/mpv:jpeg2000 \
     native=./mpv.app/Contents/MacOS/mpv:jpeg2000 \
     libj2k=./mpv.app/Contents/MacOS/mpv:libj2k
 ```
 
-The player runs with `--no-config --vo=null --ao=null --untimed` and eight
-decoder threads, so the measurement covers decoding and not presentation.
-Raw rows are written to `bench-results.tsv`.
+Run every output mode with logs and a combined summary:
 
-The workflow does not run this benchmark. Shared CI runners are not a stable
-timing environment. The workflow builds the app and checks correctness; run the
-timings on your own machine.
+```sh
+APP=./mpv.app/Contents/MacOS/mpv MEDIA=clip.mxf bench/matrix.sh
+```
 
-For a real DCP, cut a stream copy from a picture MXF you own instead of using
-the synthetic clip:
+`matrix.sh` covers these modes:
+
+| Mode | Video output | Audio | Clock |
+| --- | --- | --- | --- |
+| `headless` | null | off | untimed |
+| `headless-audio` | null | null, decoded | untimed |
+| `gpu` | `gpu-next` | off | untimed |
+| `gpu-audio` | `gpu-next` | CoreAudio | audio clock |
+| `playback-video` | `gpu-next` | off | real time |
+| `playback` | `gpu-next` | CoreAudio | real time |
+
+The player runs with `--no-config` and eight decoder threads, so the user's mpv
+configuration does not affect the result. The null-output modes measure decoding
+throughput; `headless-audio` also sets `--ao-null-untimed` so the null audio
+device does not pace playback. `gpu-audio` and `playback` use CoreAudio, so
+their wall time is at least the audio duration. The playback modes measure
+whether the player can hold the frame clock; `ab.sh` records the final
+`frame-drop-count` for those runs. Real time in a playback mode includes player
+startup and the clip duration, and a player that cannot keep up stretches it, so
+compare dropped frames and CPU time there, not wall speedup.
+
+Set `SAMPLE_GPU=1` before `bench/ab.sh` or `bench/matrix.sh` to record GPU
+utilization next to the player logs. `bench/gpu-sampler.sh` reads the GPU's
+`Device Utilization %` once per second, writes
+`results/logs/<mode>-r<round>-<label>.gpu.tsv`, and appends a `gpu:` line with
+the average and peak to the player log. CPU utilization is the `user + sys`
+seconds divided by real seconds. `EXTRA_ARGS` passes more player arguments, for
+example `EXTRA_ARGS="--vd-lavc-o=backend=metal"` to force the `libj2k` Metal
+decoder.
+
+Raw rows are written to `results/<mode>.tsv`, logs to `results/logs/`.
+`bench/report.sh results` renders those rows as Markdown tables.
+`docs/RESULTS.md` contains the measured numbers for one machine.
+
+The synthetic clip is a dense test pattern, so its bitrate is higher than most
+DCPs and its playback is a stress test. For representative playback numbers,
+cut a stream copy from a picture MXF you own:
 
 ```sh
 ffmpeg -ss 600 -i picture.mxf -t 10 -c copy -an clip.mxf
 ```
+
+To play a whole feature, set the frame count. A DCP keeps picture and sound in
+separate MXFs; `AUDIO_FILE` adds the sound MXF without remuxing. One round is
+enough for a full feature because a round then takes as long as the programme:
+
+```sh
+MODE=playback FRAMES=17616 AUDIO_FILE=sound.mxf SAMPLE_GPU=1 \
+    bench/ab.sh 1 17616 8 picture.mxf \
+    installed=/opt/homebrew/bin/mpv:jpeg2000 \
+    native=./mpv.app/Contents/MacOS/mpv:jpeg2000 \
+    libj2k=./mpv.app/Contents/MacOS/mpv:libj2k
+```
+
+The workflow does not run this benchmark. Shared CI runners are not a stable
+timing environment. The workflow builds the app and checks correctness; run the
+timings on your own machine.
 
 The installed Homebrew mpv bundles a different FFmpeg revision from this build.
 That comparison measures two distributions, not the patch series alone.
