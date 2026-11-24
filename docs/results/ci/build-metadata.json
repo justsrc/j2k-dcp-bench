@@ -1,0 +1,16 @@
+{
+  "artifact": "mpv-j2k-dcp-macos-arm64.zip",
+  "mpv_sha": "f92afa75cdb06e077a9ecd9a9ec2eb36b16327c2",
+  "mpv_build_sha": "9443097290e82008f26f1597590926c63e7ae053",
+  "ffmpeg_sha": "359c82515228774eb683dffce9d623b6b4a2fa53",
+  "ffmpeg_patches": 11,
+  "libass_sha": "21b5a54fceff49c126c201d4b51c6445287a5072",
+  "libplacebo_sha": "f2e04cb1840ef1f1586b71050bff40b04cbd8d91",
+  "j2k_sha": "0c61cb298a66b94c8536db5e2220cce4d8112200",
+  "libdovi": "3.4.0",
+  "rust": "1.99.0",
+  "runner": "macos27",
+  "run_url": "https://github.com/justsrc/j2k-dcp-bench/actions/runs/45264544189",
+  "built_at": "2026-11-23T21:28:19Z",
+  "ffmpeg_license": "GPL-3.0-or-later"
+}

@@ -1,0 +1,27 @@
+== player
+mpv v0.42.0-dev-gf92afa75c Copyright © 2000-2026 mpv/MPlayer/mplayer2 projects
+ built on Nov 17 2026 13:31:11
+libplacebo version: v7.398.0 (v7.387.0-132-gf2e04cb1)
+FFmpeg version: N-129219-g359c825152
+
+== decoder list
+native jpeg2000: present
+libj2k:          present
+
+== full decode, 240 frames, 8 threads
+jpeg2000: 240 frames, exit 0, 7s
+libj2k: 240 frames, exit 0, 7s
+
+== audio decode
+PCM audio track decoded, no underruns
+
+== sampled frame agreement
+0 s: identical
+2.5 s: PSNR 96.141802 dB
+5 s: PSNR 96.798717 dB
+7.5 s: PSNR 95.229911 dB
+9.958333 s: PSNR 93.604242 dB
+identical frames: 1/5
+lowest PSNR:      93.604242 dB
+
+PASS

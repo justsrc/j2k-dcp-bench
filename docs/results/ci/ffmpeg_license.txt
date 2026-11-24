@@ -1,0 +1,5 @@
+libavcodec license: GPL version 3 or later
+libavutil license: GPL version 3 or later
+libavfilter license: GPL version 3 or later
+libavformat license: GPL version 3 or later
+libavdevice license: GPL version 3 or later
