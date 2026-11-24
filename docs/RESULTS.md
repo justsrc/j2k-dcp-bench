@@ -1,7 +1,7 @@
 # Results
 
-These numbers come from one machine, one build and one clip. They describe that
-setup, not a guarantee for other hardware or media.
+These numbers come from one machine, one build and the media described below.
+They describe that setup, not a guarantee for other hardware or content.
 
 ## Build
 
